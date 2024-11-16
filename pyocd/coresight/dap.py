@@ -1,7 +1,8 @@
 # pyOCD debugger
 # Copyright (c) 2015-2020 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2021-2023 Chris Reed
 # Copyright (c) 2022 Clay McClure
+# Copyright (c) 2022 Toshiba Electronic Devices & Storage Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,13 +17,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 from enum import Enum
-from typing import (Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, TYPE_CHECKING, Union, overload)
+from typing import (cast, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, TYPE_CHECKING, Union, overload)
 from typing_extensions import Literal
 
 from ..core import (exceptions, memory_interface)
 from ..core.target import Target
+from ..core.target_delegate import DelegateHavingMixIn
 from ..probe.debug_probe import DebugProbe
 from ..probe.swj import SWJSequenceSender
 from .ap import APSEL_APBANKSEL
@@ -117,26 +121,24 @@ class ADIVersion(Enum):
     ADIv5 = 5
     ADIv6 = 6
 
-class DPConnector:
-    """@brief Establishes a connection to the DP for a given wire protocol.
+class ProbeConnector:
+    """@brief Configures the debug probe for a given wire protocol.
 
-    This class will ask the probe to connect using a given wire protocol. Then it makes multiple
-    attempts at sending the SWJ sequence to select the wire protocol and read the DP IDR register.
+    This class will ask the probe to connect using a given wire protocol, unless the probe is already
+    connected.
     """
 
     def __init__(self, probe: DebugProbe) -> None:
+        """@brief Constructor.
+        @param self
+        @param probe The DebugProbe instance to connect.
+        """
         self._probe = probe
-        self._idr = DPIDR(0, 0, 0, 0, 0)
 
         # Make sure we have a session, since we get the session from the probe and probes have their session set
         # after creation.
-        assert probe.session is not None, "DPConnector requires the probe to have a session"
+        assert probe.session is not None, "ProbeConnector requires the probe to have a session"
         self._session = probe.session
-
-    @property
-    def idr(self) -> DPIDR:
-        """@brief DPIDR instance containing values read from the DP IDR register."""
-        return self._idr
 
     def _get_protocol(self, protocol: Optional[DebugProbe.Protocol]) -> DebugProbe.Protocol:
         # Convert protocol from setting if not passed as parameter.
@@ -148,9 +150,7 @@ class DPConnector:
         return protocol
 
     def connect(self, protocol: Optional[DebugProbe.Protocol] = None) -> None:
-        """@brief Establish a connection to the DP.
-
-        This method causes the debug probe to connect using the wire protocol.
+        """@brief Cause the debug probe to connect using the wire protocol.
 
         @param self
         @param protocol One of the @ref pyocd.probe.debug_probe.DebugProbe.Protocol
@@ -170,14 +170,9 @@ class DPConnector:
             already_connected = current_wire_protocol is not None
 
             if already_connected:
-                assert current_wire_protocol
                 self._check_protocol(current_wire_protocol, protocol)
             else:
                 self._connect_probe(protocol)
-
-            protocol = self._probe.wire_protocol
-            assert protocol
-            self._connect_dp(protocol)
         finally:
             self._probe.unlock()
 
@@ -202,57 +197,101 @@ class DPConnector:
             assert actual_protocol
             LOG.debug("Default wire protocol selected; using %s", actual_protocol.name)
 
-    def _connect_dp(self, protocol: DebugProbe.Protocol) -> None:
-        # Get SWJ settings.
-        use_dormant = self._session.options.get('dap_swj_use_dormant')
-        send_swj = self._session.options.get('dap_swj_enable') \
-                and (DebugProbe.Capability.SWJ_SEQUENCE in self._probe.capabilities)
+class DPConnector:
+    """@brief Establishes a connection to the DP for a given wire protocol.
 
-        # Create object to send SWJ sequences.
-        swj = SWJSequenceSender(self._probe, use_dormant)
+    This class will make multiple attempts at sending the SWJ sequence to select the wire protocol and read the
+    DP IDR register. The probe must be already connected for the desired wire protocol.
+    """
 
-        # Multiple attempts to select protocol and read DP IDR.
-        for attempt in range(4):
-            try:
-                if send_swj:
-                    swj.select_protocol(protocol)
+    def __init__(self, probe: DebugProbe) -> None:
+        self._probe = probe
+        self._idr = DPIDR(0, 0, 0, 0, 0)
 
-                # Attempt to read the DP IDR register.
-                self._idr = self.read_idr()
+        # Make sure we have a session, since we get the session from the probe and probes have their session set
+        # after creation.
+        assert probe.session is not None, "DPConnector requires the probe to have a session"
+        self._session = probe.session
 
-                # Successful connection so exit the loop.
-                break
-            except exceptions.TransferError:
-                # If not sending the SWJ sequence, just reraise; there's nothing more to do.
-                if not send_swj:
-                    raise
+    @property
+    def idr(self) -> DPIDR:
+        """@brief DPIDR instance containing values read from the DP IDR register."""
+        return self._idr
 
-                # If the read of the DP IDCODE fails, retry SWJ sequence. The DP may have been
-                # in a state where it thought the SWJ sequence was an invalid transfer. We also
-                # try enabling use of dormant state if it wasn't already enabled.
-                LOG.debug("DP IDCODE read failed; resending SWJ sequence (use dormant=%s)", use_dormant)
+    def connect(self) -> None:
+        """@brief Establish a connection to the DP."""
+        try:
+            self._probe.lock()
 
-                if attempt == 1:
-                    # If already using dormant mode, just raise, we don't need to retry the same mode.
-                    if use_dormant:
+            protocol = self._probe.wire_protocol
+            assert protocol is not None, "the probe must already be connected"
+
+            # Get SWJ settings.
+            use_dormant = self._session.options.get('dap_swj_use_dormant')
+            send_swj = self._session.options.get('dap_swj_enable') \
+                    and (DebugProbe.Capability.SWJ_SEQUENCE in self._probe.capabilities)
+
+            # Create object to send SWJ sequences.
+            swj = SWJSequenceSender(self._probe, use_dormant)
+
+            def jtag_enter_run_test_idle():
+                self._probe.jtag_sequence(6, 1, False, 0x3f)
+                self._probe.jtag_sequence(1, 0, False, 0x1)
+
+            if protocol == DebugProbe.Protocol.JTAG \
+               and DebugProbe.Capability.JTAG_SEQUENCE in self._probe.capabilities:
+                use_jtag_enter_run_test_idle = True
+            else:
+                use_jtag_enter_run_test_idle = False
+
+            # Multiple attempts to select protocol and read DP IDR.
+            for attempt in range(4):
+                try:
+                    if send_swj:
+                        swj.select_protocol(protocol)
+
+                    if use_jtag_enter_run_test_idle:
+                        jtag_enter_run_test_idle()
+
+                    # Attempt to read the DP IDR register.
+                    self._idr = self.read_idr()
+
+                    # Successful connection so exit the loop.
+                    break
+                except exceptions.TransferError:
+                    # If not sending the SWJ sequence, just reraise; there's nothing more to do.
+                    if not send_swj:
                         raise
 
-                    # After the second attempt, switch to enabling dormant mode.
-                    swj.use_dormant = True
-                elif attempt == 3:
-                    # After 4 attempts, we let the exception propagate.
-                    raise
+                    # If the read of the DP IDCODE fails, retry SWJ sequence. The DP may have been
+                    # in a state where it thought the SWJ sequence was an invalid transfer. We also
+                    # try enabling use of dormant state if it wasn't already enabled.
+                    LOG.debug("DP IDCODE read failed; resending SWJ sequence (use dormant=%s)", use_dormant)
 
-    def read_idr(self):
+                    if attempt == 1:
+                        # If already using dormant mode, just raise, we don't need to retry the same mode.
+                        if use_dormant:
+                            raise
+
+                        # After the second attempt, switch to enabling dormant mode.
+                        swj.use_dormant = True
+                    elif attempt == 3:
+                        # After 4 attempts, we let the exception propagate.
+                        raise
+        finally:
+            self._probe.unlock()
+
+    def read_idr(self) -> DPIDR:
         """@brief Read IDR register and get DP version"""
         dpidr = self._probe.read_dp(DP_IDR, now=True)
+        TRACE.debug("DPConnector read DP_IDR = 0x%08x", dpidr)
         dp_partno = (dpidr & DPIDR_PARTNO_MASK) >> DPIDR_PARTNO_SHIFT
         dp_version = (dpidr & DPIDR_VERSION_MASK) >> DPIDR_VERSION_SHIFT
         dp_revision = (dpidr & DPIDR_REVISION_MASK) >> DPIDR_REVISION_SHIFT
         is_mindp = (dpidr & DPIDR_MIN_MASK) != 0
         return DPIDR(dpidr, dp_partno, dp_version, dp_revision, is_mindp)
 
-class DebugPort:
+class DebugPort(DelegateHavingMixIn):
     """@brief Represents the Arm Debug Interface (ADI) Debug Port (DP)."""
 
     ## Sleep for 50 ms between connection tests and reconnect attempts after a reset.
@@ -273,9 +312,9 @@ class DebugPort:
         self.target = target
         assert target.session
         self._session = target.session
-        self.valid_aps: Optional[List["APAddressBase"]] = None
+        self.valid_aps: Optional[List[APAddressBase]] = None
         self.dpidr = DPIDR(0, 0, 0, 0, 0)
-        self.aps: Dict["APAddressBase", "AccessPort"] = {}
+        self.aps: Dict[APAddressBase, AccessPort] = {}
         self._access_number: int = 0
         self._cached_dp_select: Optional[int] = None
         self._protocol: Optional[DebugProbe.Protocol] = None
@@ -303,7 +342,7 @@ class DebugPort:
         return self._probe
 
     @property
-    def session(self) -> "Session":
+    def session(self) -> Session:
         return self._session
 
     @property
@@ -316,7 +355,7 @@ class DebugPort:
         return self._base_addr
 
     @property
-    def apacc_memory_interface(self) -> "APAccessMemoryInterface":
+    def apacc_memory_interface(self) -> APAccessMemoryInterface:
         """@brief Memory interface for performing APACC transactions."""
         if self._apacc_mem_interface is None:
             self._apacc_mem_interface = APAccessMemoryInterface(self)
@@ -400,13 +439,39 @@ class DebugPort:
         self._probe_supports_apv2_addresses = (DebugProbe.Capability.APv2_ADDRESSES in caps)
         self._have_probe_capabilities = True
 
+    # Usually when we call a debug sequence, we first check if the sequence exists. For the below
+    # methods, we rely on .call_pre_discovery_debug_sequence() to do this for us.
+    def connect_debug_port_hook(self) -> Optional[bool]:
+        from .coresight_target import CoreSightTarget
+        cst = cast(CoreSightTarget, self.session.target)
+        return cst.call_pre_discovery_debug_sequence('DebugPortSetup')
+
+    def enable_debug_port_hook(self) -> Optional[bool]:
+        from .coresight_target import CoreSightTarget
+        cst = cast(CoreSightTarget, self.session.target)
+        return cst.call_pre_discovery_debug_sequence('DebugPortStart')
+
+    def disable_debug_port_hook(self) -> Optional[bool]:
+        from .coresight_target import CoreSightTarget
+        cst = cast(CoreSightTarget, self.session.target)
+        return cst.call_pre_discovery_debug_sequence('DebugPortStop')
+
     def _connect(self) -> None:
-        # Attempt to connect.
+        # Connect the probe.
+        probe_conn = ProbeConnector(self.probe)
+        probe_conn.connect(self._protocol)
+
+        # Attempt to connect DP.
         connector = DPConnector(self.probe)
-        connector.connect(self._protocol)
+        if not self.connect_debug_port_hook():
+            connector.connect()
+            self.dpidr = connector.idr
+        else:
+            # We still need to read the IDR for our own use.
+            self.dpidr = connector.read_idr()
+        assert self.dpidr
 
         # Report on DP version.
-        self.dpidr = connector.idr
         LOG.log(logging.INFO if self._log_dp_info else logging.DEBUG,
             "DP IDR = 0x%08x (v%d%s rev%d)", self.dpidr.idr, self.dpidr.version,
             " MINDP" if self.dpidr.mindp else "", self.dpidr.revision)
@@ -481,6 +546,9 @@ class DebugPort:
 
         @return Boolean indicating whether the power up request succeeded.
         """
+        if self.enable_debug_port_hook():
+            return True
+
         # Send power up request for system and debug.
         self.write_reg(DP_CTRL_STAT, CSYSPWRUPREQ | CDBGPWRUPREQ | MASKLANE | TRNNORMAL)
 
@@ -504,6 +572,9 @@ class DebugPort:
 
         @return Boolean indicating whether the power down request succeeded.
         """
+        if self.disable_debug_port_hook():
+            return True
+
         # Power down system first.
         self.write_reg(DP_CTRL_STAT, CDBGPWRUPREQ | MASKLANE | TRNNORMAL)
 
@@ -532,7 +603,7 @@ class DebugPort:
         """@brief Invalidate cached DP registers."""
         self._cached_dp_select = None
 
-    def _reset_did_occur(self, notification: "Notification") -> None:
+    def _reset_did_occur(self, notification: Notification) -> None:
         """@brief Handles reset notifications to invalidate register cache.
 
         The cache is cleared on all resets just to be safe. On most devices, warm resets do not reset
@@ -970,7 +1041,7 @@ class APAccessMemoryInterface(memory_interface.MemoryInterface):
     Only 32-bit transfers are supported.
     """
 
-    def __init__(self, dp: DebugPort, ap_address: Optional["APAddressBase"] = None) -> None:
+    def __init__(self, dp: DebugPort, ap_address: Optional[APAddressBase] = None) -> None:
         """@brief Constructor.
 
         @param self

@@ -121,23 +121,24 @@ class ADIv5Discovery(CoreSightDiscovery):
             return
 
         ap_list = []
-        apsel = 0
         invalid_count = 0
-        while apsel < self.MAX_APSEL:
+        for apsel in range(self.MAX_APSEL):
             try:
                 isValid = AccessPort.probe(self.dp, apsel)
                 if isValid:
                     ap_list.append(apsel)
                     invalid_count = 0
-                elif not self.session.options.get('scan_all_aps'):
+                else:
                     invalid_count += 1
-                    if invalid_count == self.session.options.get('adi.v5.max_invalid_ap_count'):
-                        break
             except exceptions.Error as e:
-                LOG.error("Exception while probing AP#%d: %s", apsel, e,
+                LOG.error("Error probing AP#%d: %s", apsel, e,
                     exc_info=self.session.log_tracebacks)
+                invalid_count += 1
+
+            # Stop scanning if we've seen a maximum number of invalid APs, unless `scan_all_aps` is set.
+            if not self.session.options.get('scan_all_aps') \
+                    and invalid_count >= self.session.options.get('adi.v5.max_invalid_ap_count'):
                 break
-            apsel += 1
 
         # Update the AP list once we know it's complete.
         self.dp.valid_aps = ap_list
@@ -161,8 +162,10 @@ class ADIv5Discovery(CoreSightDiscovery):
             ap_address = APv1Address(apsel)
             ap = AccessPort.create(self.dp, ap_address)
             self.dp.aps[ap_address] = ap
+
+            LOG.info("%s IDR = 0x%08x (%s)", ap.short_description, ap.idr, ap.description)
         except exceptions.Error as e:
-            LOG.error("Exception reading AP#%d IDR: %s", apsel, e,
+            LOG.error("Error reading AP#%d IDR: %s", apsel, e,
                 exc_info=self.session.log_tracebacks)
 
     def _find_components(self):
@@ -241,8 +244,10 @@ class ADIv6Discovery(CoreSightDiscovery):
             ap_address = APv2Address(cmpid.address)
             ap = AccessPort.create(self.dp, ap_address, cmpid=cmpid)
             self.dp.aps[ap_address] = ap
+
+            LOG.info("%s IDR = 0x%08x (%s)", ap.short_description, ap.idr, ap.description)
         except exceptions.Error as e:
-            LOG.error("Exception reading AP@0x%08x IDR: %s", cmpid.address, e,
+            LOG.error("Error reading AP@0x%08x IDR: %s", cmpid.address, e,
                     exc_info=self.session.log_tracebacks)
 
     def _create_root_component(self, cmpid):
@@ -261,7 +266,7 @@ class ADIv6Discovery(CoreSightDiscovery):
             self.target.add_child(component)
             component.init()
         except exceptions.Error as e:
-            LOG.error("Exception creating root component at address 0x%08x: %s", cmpid.address, e,
+            LOG.error("Error creating root component at address 0x%08x: %s", cmpid.address, e,
                     exc_info=self.session.log_tracebacks)
 
     def _find_components_on_aps(self):

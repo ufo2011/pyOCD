@@ -61,6 +61,8 @@ from . import target_nRF51822_xxAA
 from . import target_nRF52832_xxAA
 from . import target_nRF52833_xxAA
 from . import target_nRF52840_xxAA
+from . import target_nRF91xx
+from . import target_S32K344
 from . import target_STM32F103RC
 from . import target_STM32F051T8
 from . import target_STM32F412xx
@@ -75,6 +77,8 @@ from . import target_MAX32620
 from . import target_MAX32625
 from . import target_MAX32630
 from . import target_MAX32660
+from . import target_MAX32666
+from . import target_MAX32670
 from . import target_w7500
 from . import target_s5js100
 from . import target_LPC1114FN28_102
@@ -86,6 +90,7 @@ from . import target_LPC4088FBD144
 from . import target_lpc4088qsb
 from . import target_lpc4088dm
 from . import target_RTL8195AM
+from . import target_RTL8762C
 from . import target_CC3220SF
 from . import target_CC3220SF
 from ..family import target_psoc6
@@ -100,12 +105,16 @@ from . import target_musca_b1
 from . import target_musca_s1
 from . import target_LPC5526Jxxxxx
 from . import target_LPC55S69Jxxxxx
+from . import target_LPC55S16
 from . import target_LPC55S36
 from . import target_LPC55S28Jxxxxx
 from . import target_M251
 from . import target_M261
+from . import target_M460
 from . import target_M480
 from . import target_M2354
+from . import target_HC32F448
+from . import target_HC32F45x
 from . import target_HC32F460
 from . import target_HC32F4A0
 from . import target_HC32M423
@@ -115,15 +124,28 @@ from . import target_HC32L110
 from . import target_HC32L13x
 from . import target_HC32L19x
 from . import target_HC32L07x
+from . import target_MPS2_AN521
 from . import target_MPS3_AN522
 from . import target_MPS3_AN540
 from . import target_RP2040
+from . import target_ytm32b1ld0
+from . import target_ytm32b1le0
+from . import target_ytm32b1me0
+from . import target_ytm32b1md1
+from . import target_STM32H723xx
+from . import target_STM32H743xx
+from . import target_STM32H7B0xx
+from . import target_Air001
+from . import target_Air32F103xx
+from . import target_AMA3B1KK
 
 ## @brief Dictionary of all builtin targets.
 #
-# @note Target type names must be all lowercase and use _underscores_ instead of dashes. The code in Board
-#   automatically converts dashes in user-supplied target type names to underscores.
+# @note Target type names must be a valid C identifier, normalised to all lowercase, using _underscores_
+#   instead of dashes punctuation. See pyocd.target.normalise_target_type_name() for the code that
+#   normalises user-provided target type names for comparison with these.
 BUILTIN_TARGETS = {
+          'mps2_an521': target_MPS2_AN521.AN521,
           'mps3_an522': target_MPS3_AN522.AN522,
           'mps3_an540': target_MPS3_AN540.AN540,
           'cortex_m': CoreSightTarget,
@@ -166,6 +188,8 @@ BUILTIN_TARGETS = {
           'max32625': target_MAX32625.MAX32625,
           'max32630': target_MAX32630.MAX32630,
           'max32660': target_MAX32660.MAX32660,
+          'max32666': target_MAX32666.MAX32666,
+          'max32670': target_MAX32670.MAX32670,
           'mimxrt1010': target_MIMXRT1011xxxxx.MIMXRT1011xxxxx,
           'mimxrt1015': target_MIMXRT1015xxxxx.MIMXRT1015xxxxx,
           'mimxrt1020': target_MIMXRT1021xxxxx.MIMXRT1021xxxxx,
@@ -183,6 +207,8 @@ BUILTIN_TARGETS = {
           'nrf52832': target_nRF52832_xxAA.NRF52832,
           'nrf52833': target_nRF52833_xxAA.NRF52833,
           'nrf52840' : target_nRF52840_xxAA.NRF52840,
+          'nrf91' : target_nRF91xx.NRF91XX,
+          's32k344': target_S32K344.S32K344,
           'stm32f103rc': target_STM32F103RC.STM32F103RC,
           'stm32f051': target_STM32F051T8.STM32F051,
           'stm32f412xe' : target_STM32F412xx.STM32F412xE,
@@ -197,6 +223,9 @@ BUILTIN_TARGETS = {
           'stm32l475xe' : target_STM32L475xx.STM32L475xE,
           'stm32l475xg' : target_STM32L475xx.STM32L475xG,
           'stm32l031x6' : target_STM32L031x6.STM32L031x6,
+          'stm32h723xx' : target_STM32H723xx.STM32H723xx,
+          'stm32h743xx' : target_STM32H743xx.STM32H743xx,
+          'stm32h7b0xx' : target_STM32H7B0xx.STM32H7B0xx,
           'w7500': target_w7500.W7500,
           's5js100': target_s5js100.S5JS100,
           'lpc11xx_32': target_LPC1114FN28_102.LPC11XX_32,
@@ -208,6 +237,7 @@ BUILTIN_TARGETS = {
           'lpc4088qsb': target_lpc4088qsb.LPC4088qsb,
           'lpc4088dm': target_lpc4088dm.LPC4088dm,
           'rtl8195am': target_RTL8195AM.RTL8195AM,
+          'rtl8762c': target_RTL8762C.RTL8762C,
           'cc3220sf': target_CC3220SF.CC3220SF,
           'cy8c6xxa': target_CY8C6xxA.CY8C6xxA,
           'cy8c6xx7': target_CY8C6xx7.CY8C6xx7,
@@ -230,6 +260,7 @@ BUILTIN_TARGETS = {
           'musca_s1' : target_musca_s1.MuscaS1,
           'lpc5526'  : target_LPC5526Jxxxxx.LPC5526,
           'lpc55s69' : target_LPC55S69Jxxxxx.LPC55S69,
+          'lpc55s16' : target_LPC55S16.LPC55S16,
           'lpc55s36' : target_LPC55S36.LPC55S36,
           'lpc55s28' : target_LPC55S28Jxxxxx.LPC55S28,
           'cy8c64xx_cm0_full_flash' : target_CY8C64xx.cy8c64xx_cm0_full_flash,
@@ -240,16 +271,26 @@ BUILTIN_TARGETS = {
           'cy8c64x5_cm4_full_flash' : target_CY8C64x5.cy8c64x5_cm4_full_flash,
           'm252kg6ae' : target_M251.M252KG6AE,
           'm263kiaae' : target_M261.M263KIAAE,
+          'm467hjhae' : target_M460.M467HJHAE,
           'm487jidae' : target_M480.M487JIDAE,
           'm2354kjfae' : target_M2354.M2354KJFAE,
+          'hc32f448xa' : target_HC32F448.HC32F448xA,
+          'hc32f448xc' : target_HC32F448.HC32F448xC,
+          'hc32f451xc' : target_HC32F45x.HC32F451xC,
+          'hc32f451xe' : target_HC32F45x.HC32F451xE,
+          'hc32f452xc' : target_HC32F45x.HC32F452xC,
+          'hc32f452xe' : target_HC32F45x.HC32F452xE,
           'hc32f460xc' : target_HC32F460.HC32F460xC,
           'hc32f460xe' : target_HC32F460.HC32F460xE,
+          'hc32a460xe' : target_HC32F460.HC32F460xE,
           'hc32f4a0xg' : target_HC32F4A0.HC32F4A0xG,
           'hc32f4a0xi' : target_HC32F4A0.HC32F4A0xI,
+          'hc32a4a0xi' : target_HC32F4A0.HC32F4A0xI,
           'hc32m423xa' : target_HC32M423.HC32M423xA,
           'hc32f120x6' : target_HC32x120.HC32F120x6TA,
           'hc32f120x8' : target_HC32x120.HC32F120x8TA,
           'hc32m120' : target_HC32x120.HC32M120,
+          'hc32m120x6' : target_HC32x120.HC32M120,
           'hc32f160xa' : target_HC32F160.HC32F160xA,
           'hc32f160xc' : target_HC32F160.HC32F160xC,
           'hc32l110' : target_HC32L110.HC32L110,
@@ -268,4 +309,15 @@ BUILTIN_TARGETS = {
           'rp2040' : target_RP2040.RP2040Core0,
           'rp2040_core0' : target_RP2040.RP2040Core0,
           'rp2040_core1' : target_RP2040.RP2040Core1,
+          'ytm32b1ld0': target_ytm32b1ld0.YTM32B1LD0,
+          'ytm32b1le0': target_ytm32b1le0.YTM32B1LE0,
+          'ytm32b1me0': target_ytm32b1me0.YTM32B1ME0,
+          'ytm32b1md1': target_ytm32b1md1.YTM32B1MD1,
+          'air001': target_Air001.Air001,
+          'air32f103xb': target_Air32F103xx.Air32F103xB,
+          'air32f103xc': target_Air32F103xx.Air32F103xC,
+          'air32f103xp': target_Air32F103xx.Air32F103xP,
+          'air32f103xe': target_Air32F103xx.Air32F103xE,
+          'air32f103xg': target_Air32F103xx.Air32F103xG,
+          'ama3b1kk_kbr': target_AMA3B1KK.AMA3B1KK_KBR,
          }

@@ -1,6 +1,6 @@
 # pyOCD debugger
 # Copyright (c) 2018-2019 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2021-2023 Chris Reed
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,29 +15,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-import logging
-from pyocd.core.target import Target
-from time import time
-from typing import (Any, Callable, Dict, List, Optional, TYPE_CHECKING, Union)
+from __future__ import annotations
 
-from .builder import (
-    FlashBuilder,
-    MemoryBuilder,
-    ProgrammingInfo,
-    get_page_count,
-    get_sector_count,
-)
+import logging
+from dataclasses import dataclass
+from time import time
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union, cast)
+
 from ..core import exceptions
+from ..core.memory_map import RamRegion
+from ..core.target import Target
 from ..utility.progress import print_progress
+from .builder import (FlashBuilder, MemoryBuilder, ProgrammingInfo, get_page_count, get_sector_count)
 
 if TYPE_CHECKING:
+    from ..core.memory_map import MemoryMap, MemoryRegion
     from ..core.session import Session
-    from ..core.memory_map import (
-        MemoryRegion,
-        MemoryMap,
-        RamRegion,
-    )
 
 LOG = logging.getLogger(__name__)
 
@@ -54,8 +47,9 @@ class RamBuilder(MemoryBuilder):
     ## Maximum number of bytes to write at once. This is primarily done so progress is updated occasionally.
     _MAX_WRITE_SIZE = 4096
 
-    def __init__(self, session: "Session", region: "RamRegion") -> None:
+    def __init__(self, session: "Session", region: MemoryRegion) -> None:
         """@brief Constructor."""
+        assert region.is_writable, "Memory region passed to RamBuilder must be directly writable"
         super().__init__()
         self._session = session
         self._region = region
@@ -99,6 +93,9 @@ class RamBuilder(MemoryBuilder):
         # Make sure progress has reached 100%.
         if progress_cb is not None:
             progress_cb(1.0)
+
+        if kwargs.get("no_reset", False) is False:
+            target.reset_and_halt()
 
         # Return some performance numbers.
         return ProgrammingInfo(
@@ -145,6 +142,7 @@ class MemoryLoader:
     _smart_flash: Optional[bool]
     _trust_crc: Optional[bool]
     _keep_unwritten: Optional[bool]
+    _no_reset: Optional[bool]
 
     def __init__(self,
             session: "Session",
@@ -152,7 +150,8 @@ class MemoryLoader:
             chip_erase: Optional[bool] = None,
             smart_flash: Optional[bool] = None,
             trust_crc: Optional[bool] = None,
-            keep_unwritten: Optional[bool] = None
+            keep_unwritten: Optional[bool] = None,
+            no_reset: Optional[bool] = None
         ):
         """@brief Constructor.
 
@@ -173,6 +172,8 @@ class MemoryLoader:
             written, there may be ranges of flash that would be erased but not written with new
             data. This parameter sets whether the existing contents of those unwritten ranges will
             be read from memory and restored while programming.
+        @param no_reset Boolean indicating whether if the device should not be reset after the
+            programming process has finished.
         """
         self._session = session
         assert session.board
@@ -195,6 +196,8 @@ class MemoryLoader:
                             else self._session.options.get('fast_program')
         self._keep_unwritten = keep_unwritten if (keep_unwritten is not None) \
                             else self._session.options.get('keep_unwritten')
+        self._no_reset = no_reset if (no_reset is not None) \
+                            else self._session.options.get('no_reset')
 
         self._reset_state()
 
@@ -241,7 +244,9 @@ class MemoryLoader:
                     region_builder = region.flash.get_flash_builder()
                     region_builder.log_performance = False
                 elif region.is_writable:
-                    region_builder = RamBuilder(self._session, region)
+                    # Casting to a RamRegion is technically not quite right, since we're only checking
+                    # that the region is writable
+                    region_builder = RamBuilder(self._session, cast(RamRegion, region))
                 else:
                     raise ValueError(f"memory region at address {address:#010x} is not writable")
 
@@ -290,7 +295,8 @@ class MemoryLoader:
                                     progress_cb=self._progress_cb,
                                     smart_flash=self._smart_flash,
                                     fast_verify=self._trust_crc,
-                                    keep_unwritten=self._keep_unwritten)
+                                    keep_unwritten=self._keep_unwritten,
+                                    no_reset=self._no_reset)
             perfList.append(perf)
             didChipErase = True
 

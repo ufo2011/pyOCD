@@ -1,5 +1,5 @@
 # pyOCD debugger
-# Copyright (c) 2017-2021 Maxim Integrated (Part of Analog Devices)
+# Copyright (c) 2021 Maxim Integrated (now owned by Analog Devices, Inc.)
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,7 +58,7 @@ FLASH_ALGO = {
     'page_size' : 0x400,
     'analyzer_supported' : False,
     'analyzer_address' : 0x00000000,
-    'page_buffers' : [0x20001000, 0x20001400],   # Enable double buffering
+    'page_buffers' : [0x20001000, 0x20002000],   # Enable double buffering
     'min_program_length' : 0x400,
 
     # Relative region addresses and sizes

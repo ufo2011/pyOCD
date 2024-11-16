@@ -6,6 +6,36 @@ title: Built-in targets
 
 <tr><th>Target Type Name</th><th>Vendor</th><th>Name</th></tr>
 
+    <tr><td><code>air001</code></td>
+    <td>AirM2M</td>
+    <td>Air001</td>
+    </tr>
+
+    <tr><td><code>air32f103xb</code></td>
+    <td>AirM2M</td>
+    <td>Air32F103xB</td>
+    </tr>
+
+    <tr><td><code>air32f103xc</code></td>
+    <td>AirM2M</td>
+    <td>Air32F103xC</td>
+    </tr>
+
+    <tr><td><code>air32f103xe</code></td>
+    <td>AirM2M</td>
+    <td>Air32F103xE</td>
+    </tr>
+
+    <tr><td><code>air32f103xg</code></td>
+    <td>AirM2M</td>
+    <td>Air32F103xG</td>
+    </tr>
+
+    <tr><td><code>air32f103xp</code></td>
+    <td>AirM2M</td>
+    <td>Air32F103xP</td>
+    </tr>
+
     <tr><td><code>cc3220sf</code></td>
     <td>Texas Instruments</td>
     <td>CC3220SF</td>
@@ -126,6 +156,16 @@ title: Built-in targets
     <td>CY8C6xxA</td>
     </tr>
 
+    <tr><td><code>hc32a460xe</code></td>
+    <td>HDSC</td>
+    <td>HC32F460xE</td>
+    </tr>
+
+    <tr><td><code>hc32a4a0xi</code></td>
+    <td>HDSC</td>
+    <td>HC32F4A0xI</td>
+    </tr>
+
     <tr><td><code>hc32f003</code></td>
     <td>HDSC</td>
     <td>HC32F003</td>
@@ -174,6 +214,36 @@ title: Built-in targets
     <tr><td><code>hc32f196</code></td>
     <td>HDSC</td>
     <td>HC32F196</td>
+    </tr>
+
+    <tr><td><code>hc32f448xa</code></td>
+    <td>HDSC</td>
+    <td>HC32F448xA</td>
+    </tr>
+
+    <tr><td><code>hc32f448xc</code></td>
+    <td>HDSC</td>
+    <td>HC32F448xC</td>
+    </tr>
+
+    <tr><td><code>hc32f451xc</code></td>
+    <td>HDSC</td>
+    <td>HC32F451xC</td>
+    </tr>
+
+    <tr><td><code>hc32f451xe</code></td>
+    <td>HDSC</td>
+    <td>HC32F451xE</td>
+    </tr>
+
+    <tr><td><code>hc32f452xc</code></td>
+    <td>HDSC</td>
+    <td>HC32F452xC</td>
+    </tr>
+
+    <tr><td><code>hc32f452xe</code></td>
+    <td>HDSC</td>
+    <td>HC32F452xE</td>
     </tr>
 
     <tr><td><code>hc32f460xc</code></td>
@@ -232,6 +302,11 @@ title: Built-in targets
     </tr>
 
     <tr><td><code>hc32m120</code></td>
+    <td>HDSC</td>
+    <td>HC32M120</td>
+    </tr>
+
+    <tr><td><code>hc32m120x6</code></td>
     <td>HDSC</td>
     <td>HC32M120</td>
     </tr>
@@ -436,6 +511,11 @@ title: Built-in targets
     <td>LPC5526</td>
     </tr>
 
+    <tr><td><code>lpc55s16</code></td>
+    <td>NXP</td>
+    <td>LPC55S16</td>
+    </tr>
+
     <tr><td><code>lpc55s28</code></td>
     <td>NXP</td>
     <td>LPC55S28</td>
@@ -481,6 +561,11 @@ title: Built-in targets
     <td>M263KIAAE</td>
     </tr>
 
+    <tr><td><code>m467hjhae</code></td>
+    <td>Nuvoton</td>
+    <td>M467HJHAE</td>
+    </tr>
+
     <tr><td><code>m487jidae</code></td>
     <td>Nuvoton</td>
     <td>M487JIDAE</td>
@@ -504,6 +589,21 @@ title: Built-in targets
     <tr><td><code>max32630</code></td>
     <td>Maxim</td>
     <td>MAX32630</td>
+    </tr>
+
+    <tr><td><code>max32660</code></td>
+    <td>Maxim</td>
+    <td>MAX32660</td>
+    </tr>
+
+    <tr><td><code>max32666</code></td>
+    <td>Maxim</td>
+    <td>MAX32666</td>
+    </tr>
+
+    <tr><td><code>max32670</code></td>
+    <td>Maxim</td>
+    <td>MAX32670</td>
     </tr>
 
     <tr><td><code>mimxrt1010</code></td>
@@ -621,6 +721,11 @@ title: Built-in targets
     <td>NRF52840</td>
     </tr>
 
+    <tr><td><code>nrf91</code></td>
+    <td>Nordic Semiconductor</td>
+    <td>NRF91XX</td>
+    </tr>
+
     <tr><td><code>rp2040</code></td>
     <td>Raspberry Pi</td>
     <td>RP2040Core0</td>
@@ -639,6 +744,16 @@ title: Built-in targets
     <tr><td><code>rtl8195am</code></td>
     <td>Realtek Semiconductor</td>
     <td>RTL8195AM</td>
+    </tr>
+
+    <tr><td><code>rtl8762c</code></td>
+    <td>Realtek Semiconductor</td>
+    <td>RTL8762C</td>
+    </tr>
+
+    <tr><td><code>s32k344</code></td>
+    <td>NXP</td>
+    <td>S32K344</td>
     </tr>
 
     <tr><td><code>s5js100</code></td>
@@ -691,6 +806,21 @@ title: Built-in targets
     <td>STM32F767xx</td>
     </tr>
 
+    <tr><td><code>stm32h723xx</code></td>
+    <td>STMicroelectronics</td>
+    <td>STM32H723xx</td>
+    </tr>
+
+    <tr><td><code>stm32h743xx</code></td>
+    <td>STMicroelectronics</td>
+    <td>STM32H743xx</td>
+    </tr>
+
+    <tr><td><code>stm32h7b0xx</code></td>
+    <td>STMicroelectronics</td>
+    <td>STM32H7B0xx</td>
+    </tr>
+
     <tr><td><code>stm32l031x6</code></td>
     <td>STMicroelectronics</td>
     <td>STM32L031x6</td>
@@ -719,6 +849,26 @@ title: Built-in targets
     <tr><td><code>w7500</code></td>
     <td>WIZnet</td>
     <td>W7500</td>
+    </tr>
+
+    <tr><td><code>ytm32b1ld0</code></td>
+    <td>Yuntu Microelectronics</td>
+    <td>YTM32B1LD0</td>
+    </tr>
+
+    <tr><td><code>ytm32b1le0</code></td>
+    <td>Yuntu Microelectronics</td>
+    <td>YTM32B1LE0</td>
+    </tr>
+
+    <tr><td><code>ytm32b1md1</code></td>
+    <td>Yuntu Microelectronics</td>
+    <td>YTM32B1MD1</td>
+    </tr>
+
+    <tr><td><code>ytm32b1me0</code></td>
+    <td>YTMicro</td>
+    <td>YTM32B1ME0</td>
     </tr>
 
 

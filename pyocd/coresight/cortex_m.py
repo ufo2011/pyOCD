@@ -1,6 +1,6 @@
 # pyOCD debugger
 # Copyright (c) 2006-2020 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2021-2023 Chris Reed
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,9 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 from time import sleep
-from typing import (Any, Callable, List, Optional, overload, Sequence, TYPE_CHECKING, Union, cast)
+from typing import (Any, Callable, List, Optional, Set, Tuple, overload, Sequence, TYPE_CHECKING, Union, cast)
 from typing_extensions import Literal
 
 from ..core.target import Target
@@ -40,10 +42,14 @@ from .ap import MEM_AP
 if TYPE_CHECKING:
     from .coresight_target import CoreSightTarget
     from .rom_table import CoreSightComponentID
+    from ..core.core_registers import (
+        CoreRegistersIndex,
+        CoreRegisterNameOrNumberType,
+        CoreRegisterValueType,
+    )
     from ..core.session import Session
     from ..core.memory_interface import MemoryInterface
     from ..core.memory_map import MemoryMap
-    from ..core.target_delegate import DelegateResult
     from ..debug.context import DebugContext
     from ..debug.elf.elf import ELFBinaryFile
 
@@ -109,7 +115,6 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
     CPUID_REVISION_MASK = 0x0000000f
     CPUID_REVISION_POS = 0
 
-    CPUID_IMPLEMENTER_ARM = 0x41
     ARMv6M = 0xC
     ARMv7M = 0xF
 
@@ -174,18 +179,34 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
 
     # Media and FP Feature Register 0
     MVFR0 = 0xE000EF40
+    MVFR0_SINGLE_PRECISION_MASK = 0x000000f0
+    MVFR0_SINGLE_PRECISION_SHIFT = 4
+    MVFR0_SINGLE_PRECISION_SUPPORTED = 2
     MVFR0_DOUBLE_PRECISION_MASK = 0x00000f00
     MVFR0_DOUBLE_PRECISION_SHIFT = 8
+    MVFR0_DOUBLE_PRECISION_SUPPORTED = 2
 
     # Media and FP Feature Register 2
     MVFR2 = 0xE000EF48
     MVFR2_VFP_MISC_MASK = 0x000000f0
     MVFR2_VFP_MISC_SHIFT = 4
+    MVFR2_VFP_MISC_SUPPORTED = 4
+
+    # Instruction Set Attribute Register 3
+    ISAR3 = 0xE000ED6C
+    ISAR3_SIMD_MASK = 0x000000f0
+    ISAR3_SIMD_SHIFT = 4
+    ISAR3_SIMD__DSP = 0x3 # SIMD instructions from DSP extension are present
+
+    # MPU Type register
+    MPU_TYPE = 0xE000ED90
+    MPU_TYPE_DREGIONS_MASK = 0x0000ff00
+    MPU_TYPE_DREGIONS_SHIFT = 8
 
     _RESET_RECOVERY_SLEEP_INTERVAL = 0.01 # 10 ms
 
     @classmethod
-    def factory(cls, ap: "MemoryInterface", cmpid: "CoreSightComponentID", address: int) -> Any:
+    def factory(cls, ap: MemoryInterface, cmpid: CoreSightComponentID, address: int) -> Any:
         assert isinstance(ap, MEM_AP)
 
         # Create a new core instance.
@@ -205,29 +226,36 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         return core
 
     def __init__(self,
-            session: "Session",
+            session: Session,
             ap: MEM_AP,
-            memory_map: Optional["MemoryMap"] = None,
+            memory_map: Optional[MemoryMap] = None,
             core_num: int = 0,
-            cmpid: Optional["CoreSightComponentID"] = None,
+            cmpid: Optional[CoreSightComponentID] = None,
             address: Optional[int] = None
             ) -> None:
         CoreTarget.__init__(self, session, memory_map)
         CoreSightCoreComponent.__init__(self, ap, cmpid, address)
 
         self._architecture: CoreArchitecture = CoreArchitecture.ARMv6M
+        self._arch_version: Tuple[int, int] = (0, 0)
         self._extensions: List[CortexMExtension] = []
         self.core_type = 0
         self.has_fpu: bool = False
         self._core_number: int = core_num
+        self._core_name: str = "Unknown"
         self._run_token: int = 0
-        self._target_context: Optional["DebugContext"] = None
+        self._target_context: Optional[DebugContext] = None
         self._elf = None
         self.target_xml = None
         self._core_registers = CoreRegistersIndex()
-        self._supports_vectreset: bool = False
-        self._reset_catch_delegate_result: DelegateResult = False
-        self._reset_catch_saved_demcr: int = 0
+        self._supported_reset_types: Set[Target.ResetType] = {
+            Target.ResetType.HW,
+            Target.ResetType.SW,
+            Target.ResetType.SW_EMULATED,
+            Target.ResetType.SW_SYSTEM,
+            Target.ResetType.SW_CORE, # May be removed since only v7-M cores support SW_VECTRESET
+        }
+        self._last_vector_catch: int = 0
         self.fpb: Optional[FPB] = None
         self.dwt: Optional[DWT] = None
 
@@ -236,16 +264,17 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
 
         # Select default sw reset type based on whether multicore debug is enabled and which core
         # this is.
-        self._default_software_reset_type = Target.ResetType.SW_SYSRESETREQ \
-                    if (not self.session.options.get('enable_multicore_debug')) or (self.core_number == 0) \
-                    else Target.ResetType.SW_VECTRESET
+        self._default_software_reset_type = Target.ResetType.SW_SYSTEM \
+                    if (not self.session.options.get('enable_multicore_debug')) \
+                            or (self.core_number == self.session.options.get('primary_core')) \
+                    else Target.ResetType.SW_CORE
 
         # Set up breakpoints manager.
         self.sw_bp = SoftwareBreakpointProvider(self)
         self.bp_manager = BreakpointManager(self)
         self.bp_manager.add_provider(self.sw_bp)
 
-    def add_child(self, cmp: "CoreSightComponent") -> None:
+    def add_child(self, cmp: CoreSightComponent) -> None:
         """@brief Connect related CoreSight components."""
         super().add_child(cmp)
 
@@ -256,6 +285,11 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
             self.dwt = cmp
 
     @property
+    def name(self) -> str:
+        """@brief CPU type name."""
+        return self._core_name
+
+    @property
     def core_number(self) -> int:
         return self._core_number
 
@@ -263,6 +297,11 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
     def architecture(self) -> CoreArchitecture:
         """@brief @ref pyocd.coresight.core_ids.CoreArchitecture "CoreArchitecture" for this core."""
         return self._architecture
+
+    @property
+    def architecture_version(self) -> Tuple[int, int]:
+        """@brief Architecture major and minor version numbers."""
+        return self._arch_version
 
     @property
     def extensions(self) -> List[CortexMExtension]:
@@ -277,11 +316,16 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         return self._core_registers
 
     @property
-    def elf(self) -> Optional["ELFBinaryFile"]:
+    def supported_reset_types(self) -> Set[Target.ResetType]:
+        """@brief Set of reset types that can be used with this target."""
+        return self._supported_reset_types
+
+    @property
+    def elf(self) -> Optional[ELFBinaryFile]:
         return self._elf
 
     @elf.setter
-    def elf(self, elffile: "ELFBinaryFile") -> None:
+    def elf(self, elffile: ELFBinaryFile) -> None:
         self._elf = elffile
 
     @property
@@ -290,7 +334,16 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
 
     @default_reset_type.setter
     def default_reset_type(self, reset_type: Target.ResetType) -> None:
+        """@brief Modify the default software reset method.
+        @param self
+        @param reset_type One of the Target.ResetType enums, and must be in the `.supported_reset_types`
+            property.
+        @exception ValueError The provided reset type is not supported for this target; see
+            `.supported_reset_types` property.
+        """
         assert isinstance(reset_type, Target.ResetType)
+        if reset_type not in self._supported_reset_types:
+            raise ValueError(f"{reset_type.name} reset type not supported")
         self._default_reset_type = reset_type
 
     @property
@@ -302,11 +355,16 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         """@brief Modify the default software reset method.
         @param self
         @param reset_type Must be one of the software reset types: Target.ResetType.SW_SYSRESETREQ,
-            Target.ResetType.SW_VECTRESET, or Target.ResetType.SW_EMULATED.
+            Target.ResetType.SW_VECTRESET, or Target.ResetType.SW_EMULATED. Must also be in the
+            `.supported_reset_types` property.
+        @exception ValueError The provided reset type is not supported for this target; see
+            `.supported_reset_types` property.
         """
         assert isinstance(reset_type, Target.ResetType)
         assert reset_type in (Target.ResetType.SW_SYSRESETREQ, Target.ResetType.SW_VECTRESET,
                                 Target.ResetType.SW_EMULATED)
+        if reset_type not in self._supported_reset_types:
+            raise ValueError(f"{reset_type.name} reset type not supported")
         self._default_software_reset_type = reset_type
 
     @property
@@ -323,30 +381,61 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
 
         The bus must be accessible when this method is called.
         """
-        if not self.call_delegate('will_start_debug_core', core=self):
-            self._read_core_type()
-            self._check_for_fpu()
-            self._build_registers()
-            self.sw_bp.init()
+        self.call_delegate('will_start_debug_core', core=self)
+
+        # Enable debug, preserving any current debug state.
+        if not self.start_debug_core_hook():
+            self.write32(self.DHCSR, (self.read32(self.DHCSR) & 0xffff) | self.DBGKEY | self.C_DEBUGEN)
+
+        # Examine this CPU.
+        self._read_core_type()
+        self._check_for_fpu()
+        self._init_reset_types()
+        self._build_registers()
+        self._log_core_description()
+        self.get_vector_catch() # Cache the current vector cache settings.
+        self.sw_bp.init()
 
         self.call_delegate('did_start_debug_core', core=self)
 
     def disconnect(self, resume: bool = True) -> None:
-        if not self.call_delegate('will_stop_debug_core', core=self):
-            # Remove breakpoints and watchpoints.
-            self.bp_manager.remove_all_breakpoints()
-            if self.dwt is not None:
-                self.dwt.remove_all_watchpoints()
+        self.call_delegate('will_stop_debug_core', core=self)
+
+        # Remove breakpoints and watchpoints.
+        self.bp_manager.remove_all_breakpoints()
+        if self.dwt is not None:
+            self.dwt.remove_all_watchpoints()
+
+        # Disable core debug if resuming. Note that we don't call the 'stop_core_debug' hook
+        # (stop_debug_core delegate or DebugCoreStop sequence) if not resuming, as these will
+        # normally resume the core and disable debug logic.
+        if resume and not self.stop_debug_core_hook():
+            # Call .resume() even though we clear DHCSR just below, so that notifications get sent.
+            self.resume()
+
+            # Clear debug controls.
+            self.write32(CortexM.DHCSR, CortexM.DBGKEY | 0x0000)
 
             # Disable other debug blocks.
             self.write32(CortexM.DEMCR, 0)
 
-            # Disable core debug.
-            if resume:
-                self.resume()
-                self.write32(CortexM.DHCSR, CortexM.DBGKEY | 0x0000)
-
         self.call_delegate('did_stop_debug_core', core=self)
+
+    def start_debug_core_hook(self):
+        result = self.call_delegate('start_debug_core', core=self)
+        if not result and self.has_debug_sequence('DebugCoreStart', pname=self.node_name):
+            assert self.debug_sequence_delegate
+            self.debug_sequence_delegate.run_sequence('DebugCoreStart', pname=self.node_name)
+            result = True
+        return result
+
+    def stop_debug_core_hook(self):
+        result = self.call_delegate('stop_debug_core', core=self)
+        if not result and self.has_debug_sequence('DebugCoreStop', pname=self.node_name):
+            assert self.debug_sequence_delegate
+            self.debug_sequence_delegate.run_sequence('DebugCoreStop', pname=self.node_name)
+            result = True
+        return result
 
     def _build_registers(self) -> None:
         """@brief Build set of core registers available on this code.
@@ -367,29 +456,39 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
     def _read_core_type(self) -> None:
         """@brief Read the CPUID register and determine core type and architecture."""
         # Read CPUID register
-        cpuid = self.read32(CortexM.CPUID)
+        cpuid_cb = self.read32(CortexM.CPUID, now=False)
+        isar3_cb = self.read32(CortexM.ISAR3, now=False)
+        mpu_type_cb = self.read32(CortexM.MPU_TYPE, now=False)
 
+        # Check CPUID
+        cpuid = cpuid_cb()
         implementer = (cpuid & CortexM.CPUID_IMPLEMENTER_MASK) >> CortexM.CPUID_IMPLEMENTER_POS
-        if implementer != CortexM.CPUID_IMPLEMENTER_ARM:
-            LOG.warning("CPU implementer is not ARM!")
-
         arch = (cpuid & CortexM.CPUID_ARCHITECTURE_MASK) >> CortexM.CPUID_ARCHITECTURE_POS
         self.core_type = (cpuid & CortexM.CPUID_PARTNO_MASK) >> CortexM.CPUID_PARTNO_POS
-
         self.cpu_revision = (cpuid & CortexM.CPUID_VARIANT_MASK) >> CortexM.CPUID_VARIANT_POS
         self.cpu_patch = (cpuid & CortexM.CPUID_REVISION_MASK) >> CortexM.CPUID_REVISION_POS
 
-        # Only v7-M supports VECTRESET.
+        # Check for DSP extension
+        isar3 = isar3_cb()
+        isar3_simd = (isar3 & self.ISAR3_SIMD_MASK) >> self.ISAR3_SIMD_SHIFT
+        if isar3_simd == self.ISAR3_SIMD__DSP:
+            self._extensions.append(CortexMExtension.DSP)
+
+        # Check for MPU extension
+        mpu_type = mpu_type_cb()
+        mpu_type_dregions = (mpu_type & self.MPU_TYPE_DREGIONS_MASK) >> self.MPU_TYPE_DREGIONS_SHIFT
+        if mpu_type_dregions > 0:
+            self._extensions.append(CortexMExtension.MPU)
+
+        # Set the arch version.
         if arch == CortexM.ARMv7M:
             self._architecture = CoreArchitecture.ARMv7M
-            self._supports_vectreset = True
+            self._arch_version = (7, 0)
         else:
             self._architecture = CoreArchitecture.ARMv6M
+            self._arch_version = (6, 0)
 
-        if self.core_type in CORE_TYPE_NAME:
-            LOG.info("CPU core #%d is %s r%dp%d", self.core_number, CORE_TYPE_NAME[self.core_type], self.cpu_revision, self.cpu_patch)
-        else:
-            LOG.warning("CPU core #%d type is unrecognized", self.core_number)
+        self._core_name = CORE_TYPE_NAME.get((implementer, self.core_type), f"Unknown (CPUID={cpuid:#010x})")
 
     def _check_for_fpu(self) -> None:
         """@brief Determine if a core has an FPU.
@@ -401,36 +500,77 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
             self.has_fpu = False
             return
 
-        originalCpacr = self.read32(CortexM.CPACR)
-        cpacr = originalCpacr | CortexM.CPACR_CP10_CP11_MASK
-        self.write32(CortexM.CPACR, cpacr)
+        # Determine presence of an FPU by checking if single- and/or double-precision floating
+        # point operations are supported.
+        #
+        # Note that one of the recommended tests for an FPU was to attempt enabling the FPU via a
+        # write to CPACR and checking the result. This test has the unfortunate property of not
+        # working on certain cores when the core is held in reset, because CPACR is not accessible
+        # under reset on all cores. Thus we use MVFR0.
+        mvfr0_cb = self.read32(CortexM.MVFR0, now=False)
+        mvfr2_cb = self.read32(CortexM.MVFR2, now=False)
 
-        cpacr = self.read32(CortexM.CPACR)
-        self.has_fpu = (cpacr & CortexM.CPACR_CP10_CP11_MASK) != 0
+        mvfr0 = mvfr0_cb()
+        sp_val = (mvfr0 & CortexM.MVFR0_SINGLE_PRECISION_MASK) >> CortexM.MVFR0_SINGLE_PRECISION_SHIFT
+        dp_val = (mvfr0 & CortexM.MVFR0_DOUBLE_PRECISION_MASK) >> CortexM.MVFR0_DOUBLE_PRECISION_SHIFT
+        self.has_fpu = ((sp_val == self.MVFR0_SINGLE_PRECISION_SUPPORTED) or
+                (dp_val == self.MVFR0_DOUBLE_PRECISION_SUPPORTED))
 
-        # Restore previous value.
-        self.write32(CortexM.CPACR, originalCpacr)
+        # Deferred reads must always be evaluated, to prevent the read queue getting stuck, so read
+        # this outside the 'if' below even if we don't use it.
+        mvfr2 = mvfr2_cb()
 
         if self.has_fpu:
             self._extensions.append(CortexMExtension.FPU)
 
-            # Now check whether double-precision is supported.
-            # (Minimal tests to distinguish current permitted ARMv7-M and
-            # ARMv8-M FPU types; used for printing only).
-            mvfr0 = self.read32(CortexM.MVFR0)
-            dp_val = (mvfr0 & CortexM.MVFR0_DOUBLE_PRECISION_MASK) >> CortexM.MVFR0_DOUBLE_PRECISION_SHIFT
-
-            mvfr2 = self.read32(CortexM.MVFR2)
+            # Now check the VFP version by looking for support for the misc FP instructions added in
+            # FPv5 (VMINNM, VMAXNM, etc).
             vfp_misc_val = (mvfr2 & CortexM.MVFR2_VFP_MISC_MASK) >> CortexM.MVFR2_VFP_MISC_SHIFT
 
-            if dp_val >= 2:
-                fpu_type = "FPv5-D16-M"
+            if dp_val == self.MVFR0_DOUBLE_PRECISION_SUPPORTED:
+                # FPv5 with double-precision
                 self._extensions.append(CortexMExtension.FPU_DP)
-            elif vfp_misc_val >= 4:
-                fpu_type = "FPv5-SP-D16-M"
+                self._extensions.append(CortexMExtension.FPU_V5)
+            elif vfp_misc_val == self.MVFR2_VFP_MISC_SUPPORTED:
+                # FPv5 with only single-precision
+                self._extensions.append(CortexMExtension.FPU_V5)
             else:
+                # FPv4 has only single-precision, only present on the CM4F.
+                self._extensions.append(CortexMExtension.FPU_V4)
+
+    def _log_core_description(self) -> None:
+        core_desc = f"CPU core #{self.core_number}: {self._core_name} r{self.cpu_revision}p{self.cpu_patch}, v{self.architecture_version[0]}.{self.architecture_version[1]}-M architecture"
+        LOG.info(core_desc)
+
+        if self._extensions:
+            exts_desc = f"  Extensions: [{', '.join(sorted(x.name for x in self._extensions))}]"
+            LOG.info(exts_desc)
+
+        if self.has_fpu:
+            if CortexMExtension.FPU_V5 in self._extensions:
+                if CortexMExtension.FPU_DP in self._extensions:
+                    # FPv5 with double-precision
+                    fpu_type = "FPv5-D16-M"
+                else:
+                    # FPv5 with only single-precision
+                    fpu_type = "FPv5-SP-D16-M"
+            else:
+                # FPv4 has only single-precision, only present on the CM4F.
                 fpu_type = "FPv4-SP-D16-M"
-            LOG.info("FPU present: " + fpu_type)
+            LOG.info("  FPU present: " + fpu_type)
+
+    def _init_reset_types(self) -> None:
+        """@brief Adjust supported reset types based on the architecture."""
+        # Only v7-M supports VECTRESET.
+        if self._architecture != CoreArchitecture.ARMv7M:
+            self._supported_reset_types.remove(Target.ResetType.SW_CORE)
+
+            # Adjust the default reset types to fall back to emulated if they were set
+            # to core/vectreset.
+            if self._default_reset_type == Target.ResetType.SW_CORE:
+                self._default_reset_type = Target.ResetType.SW_EMULATED
+            if self._default_software_reset_type == Target.ResetType.SW_CORE:
+                self._default_software_reset_type = Target.ResetType.SW_EMULATED
 
     def write_memory(self, addr: int, data: int, transfer_size: int = 32) -> None:
         """@brief Write a single memory location.
@@ -589,7 +729,7 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
                 break
 
             # Read program counter and compare to [start, end)
-            program_counter = self.read_core_register('pc')
+            program_counter = self.read_core_register_raw('pc')
             if (program_counter < start) or (end <= program_counter):
                 break
 
@@ -696,6 +836,11 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         self.write_memory_block32(self.NVIC_ICPR0, [0xffffffff] * numregs)
         self.write_memory_block32(self.NVIC_IPR0, [0xffffffff] * (numregs * 8))
 
+        # Resume unless reset vector catch is enabled.
+        demcr = self.read_memory(CortexM.DEMCR)
+        if (demcr & CortexM.DEMCR_VC_CORERESET) == 0:
+            self.resume()
+
     def _get_actual_reset_type(self, reset_type):
         """@brief Determine the reset type to use given defaults and passed in type."""
 
@@ -722,9 +867,30 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         if reset_type is Target.ResetType.SW:
             reset_type = self.default_software_reset_type
 
-        # Fall back to emulated sw reset if the vectreset is specified and the core doesn't support it.
-        if (reset_type is Target.ResetType.SW_VECTRESET) and (not self._supports_vectreset):
-            reset_type = Target.ResetType.SW_EMULATED
+        # Choose fallback if the selected reset type is not available.
+        if reset_type not in self._supported_reset_types:
+            # Fall back to emulated sw reset if the vectreset is specified and the core doesn't support it.
+            # Note: at the time of writing, SW_VECTRESET==SW_CORE and SW_SYSRESETREQ==SW_SYSTEM, but this
+            # will probably be changed, thus the asserts to make sure this code is updated when that changes.
+            assert Target.ResetType.SW_VECTRESET is Target.ResetType.SW_CORE
+            assert Target.ResetType.SW_SYSRESETREQ is Target.ResetType.SW_SYSTEM
+            if reset_type is Target.ResetType.SW_VECTRESET:
+                LOG.warning("%s reset type is selected but not available; falling back to emulated core reset",
+                        reset_type.name,
+                        )
+                reset_type = Target.ResetType.SW_EMULATED
+            elif reset_type is Target.ResetType.SW_SYSRESETREQ:
+                if Target.ResetType.HW in self._supported_reset_types:
+                    LOG.warning("%s reset type is selected but not available; falling back to HW reset",
+                            reset_type.name,
+                            )
+                    reset_type = Target.ResetType.HW
+                else:
+                    LOG.warning("%s reset type is selected but not available; falling back to emulated "
+                            "core reset because HW reset is not available either",
+                            reset_type.name,
+                            )
+                    reset_type = Target.ResetType.SW_EMULATED
 
         return reset_type
 
@@ -786,6 +952,73 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
                 else:
                     LOG.debug("Core #%d did not come out of reset within timeout", self.core_number)
 
+    def reset_hook(self, reset_type: Target.ResetType) -> Optional[bool]:
+        # Must import here to prevent an import cycle.
+        from ..target.pack.reset_sequence_maps import RESET_TYPE_TO_SEQUENCE_MAP
+
+        result = self.call_delegate('will_reset', core=self, reset_type=reset_type)
+        if not result and (self.debug_sequence_delegate is not None):
+            # Map our reset type to a reset sequence name.
+            if reset_type is Target.ResetType.SW_EMULATED:
+                # Emulated reset isn't supported by standard debug sequences, so don't attempt
+                # to run any sequence.
+                return False
+            else:
+                try:
+                    reset_sequence_name = RESET_TYPE_TO_SEQUENCE_MAP[reset_type]
+                except KeyError:
+                    # Unhandled reset type.
+                    raise exceptions.InternalError(
+                            f"CortexM.reset_hook(): unhandled reset type {reset_type.name}")
+
+            if self.has_debug_sequence(reset_sequence_name, pname=self.node_name):
+                assert self.debug_sequence_delegate
+
+                # Run the reset sequence.
+                self.debug_sequence_delegate.run_sequence(reset_sequence_name, pname=self.node_name)
+                result = True
+        return result
+
+    def _inner_reset(self, reset_type: Optional[Target.ResetType], is_halting: bool) -> None:
+        """@brief Internal routine for resetting the core.
+
+        Shared by both normal and halting reset.
+        """
+        reset_type = self._get_actual_reset_type(reset_type)
+
+        LOG.debug("reset, core %d, type=%s", self.core_number, reset_type.name)
+
+        self.session.notify(Target.Event.PRE_RESET, self)
+
+        self._run_token += 1
+
+        # Give the delegate a chance to overide reset. If the delegate returns True, then it
+        # handled the reset on its own.
+        if not self.reset_hook(reset_type):
+            self._perform_reset(reset_type)
+
+        # Post reset recovery tests.
+        # We only need to test accessibility after reset for system-level resets.
+        # If a hardware reset is being used, then the DP will perform its post-reset recovery for us. Out of the
+        # other reset types, only a system-level reset by SW_SYSRESETREQ require us to ensure the DP reset recovery
+        # is performed. VECTRESET
+        if reset_type is Target.ResetType.SW_SYSRESETREQ:
+            self.ap.dp.post_reset_recovery()
+        if reset_type in (Target.ResetType.HW, Target.ResetType.SW_SYSRESETREQ):
+            # Now run the core accessibility test.
+            self._post_reset_core_accessibility_test()
+
+        # Unless this is a halting reset, make sure the core is not halted. Some DFP debug sequences
+        # (or user scripts) can leave the core halted after a reset.
+        if not is_halting:
+            if self.get_state() == Target.State.HALTED:
+                LOG.debug("reset: core was halted after non-halting reset; now resuming")
+                self.resume()
+
+        self.call_delegate('did_reset', core=self, reset_type=reset_type)
+
+        self.session.notify(Target.Event.POST_RESET, self)
+
     def reset(self, reset_type=None):
         """@brief Reset the core.
 
@@ -801,61 +1034,59 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
 
         After a call to this function, the core is running.
         """
-        reset_type = self._get_actual_reset_type(reset_type)
+        self._inner_reset(reset_type, is_halting=False)
 
-        LOG.debug("reset, core %d, type=%s", self.core_number, reset_type.name)
+    def set_reset_catch(self, reset_type=None):
+        """@brief Prepare to halt core on reset.
 
-        self.session.notify(Target.Event.PRE_RESET, self)
-
-        self._run_token += 1
-
-        # Give the delegate a chance to overide reset. If the delegate returns True, then it
-        # handled the reset on its own.
-        if not self.call_delegate('will_reset', core=self, reset_type=reset_type):
-            self._perform_reset(reset_type)
-
-        # Post reset recovery tests.
-        # We only need to test accessibility after reset for system-level resets.
-        # If a hardware reset is being used, then the DP will perform its post-reset recovery for us. Out of the
-        # other reset types, only a system-level reset by SW_SYSRESETREQ require us to ensure the DP reset recovery
-        # is performed. VECTRESET
-        if reset_type is Target.ResetType.SW_SYSRESETREQ:
-            self.ap.dp.post_reset_recovery()
-        if reset_type in (Target.ResetType.HW, Target.ResetType.SW_SYSRESETREQ):
-            # Now run the core accessibility test.
-            self._post_reset_core_accessibility_test()
-
-        self.call_delegate('did_reset', core=self, reset_type=reset_type)
-
-        self.session.notify(Target.Event.POST_RESET, self)
-
-    def set_reset_catch(self, reset_type):
-        """@brief Prepare to halt core on reset."""
+        This method nominally configures vector catch to stop code execution after the reset for the
+        core on which it is called. The delegate object and debug sequence delegate are both given a
+        chance to override the behaviour, in that order.
+        """
         LOG.debug("set reset catch, core %d", self.core_number)
 
-        self._reset_catch_delegate_result = self.call_delegate('set_reset_catch', core=self, reset_type=reset_type)
+        # First let the delegate object have a chance.
+        delegate_result = self.call_delegate('set_reset_catch', core=self, reset_type=reset_type)
 
-        # Default behaviour if the delegate didn't handle it.
-        if not self._reset_catch_delegate_result:
+        # Next in line is a debug sequence.
+        if not delegate_result and self.has_debug_sequence('ResetCatchSet', pname=self.node_name):
+            assert self.debug_sequence_delegate
+            self.debug_sequence_delegate.run_sequence('ResetCatchSet', pname=self.node_name)
+            delegate_result = True
+
+        # Default behaviour if delegates didn't handle it.
+        if not delegate_result:
             # Halt the target.
             self.halt()
 
-            # Save CortexM.DEMCR.
-            self._reset_catch_saved_demcr = self.read_memory(CortexM.DEMCR)
-
             # Enable reset vector catch if needed.
-            if (self._reset_catch_saved_demcr & CortexM.DEMCR_VC_CORERESET) == 0:
-                self.write_memory(CortexM.DEMCR, self._reset_catch_saved_demcr | CortexM.DEMCR_VC_CORERESET)
+            demcr = self.read_memory(CortexM.DEMCR)
+            if (demcr & CortexM.DEMCR_VC_CORERESET) == 0:
+                self.write_memory(CortexM.DEMCR, demcr | CortexM.DEMCR_VC_CORERESET)
 
-    def clear_reset_catch(self, reset_type):
-        """@brief Disable halt on reset."""
+    def clear_reset_catch(self, reset_type=None):
+        """@brief Disable halt on reset.
+
+        Free hardware resources allocated by set_reset_catch(), primarily meaning clearing the DEMCR.VC_CORERESET
+        bit if it was not previously set. The delegate object and debug sequence delegate are both given a
+        chance to override the behaviour, in that order.
+        """
         LOG.debug("clear reset catch, core %d", self.core_number)
 
-        self.call_delegate('clear_reset_catch', core=self, reset_type=reset_type)
+        delegate_result = self.call_delegate('clear_reset_catch', core=self, reset_type=reset_type)
 
-        if not self._reset_catch_delegate_result:
-            # restore vector catch setting
-            self.write_memory(CortexM.DEMCR, self._reset_catch_saved_demcr)
+        # Check for a debug sequence.
+        if not delegate_result and self.has_debug_sequence('ResetCatchClear', pname=self.node_name):
+            assert self.debug_sequence_delegate
+            self.debug_sequence_delegate.run_sequence('ResetCatchClear', pname=self.node_name)
+            delegate_result = True
+
+        # Default behaviour if the delegates didn't handle it.
+        if not delegate_result and not (self._last_vector_catch & Target.VectorCatch.CORE_RESET):
+            # Clear VC_CORERESET in DEMCR.
+            demcr = self.read_memory(CortexM.DEMCR)
+            if (demcr & CortexM.DEMCR_VC_CORERESET) != 0:
+                self.write_memory(CortexM.DEMCR, demcr & ~CortexM.DEMCR_VC_CORERESET)
 
     def reset_and_halt(self, reset_type=None):
         """@brief Perform a reset and stop the core on the reset handler."""
@@ -865,27 +1096,32 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         self.set_reset_catch(reset_type)
 
         # Perform the reset.
-        self.reset(reset_type)
+        self._inner_reset(reset_type, is_halting=True)
 
-        # wait until the unit resets
-        with timeout.Timeout(self.session.options.get('reset.halt_timeout')) as t_o:
-            while t_o.check():
-                if self.get_state() not in (Target.State.RESET, Target.State.RUNNING):
-                    break
-                sleep(0.01)
-            else:
-                LOG.warning("Timed out waiting for core to halt after reset (state is %s)", self.get_state().name)
+        # Wait until the unit resets. If emulated reset is used then it will have already halted
+        # for us.
+        if reset_type is not Target.ResetType.SW_EMULATED:
+            with timeout.Timeout(self.session.options.get('reset.halt_timeout')) as t_o:
+                while t_o.check():
+                    if self.get_state() not in (Target.State.RESET, Target.State.RUNNING):
+                        break
+                    sleep(0.01)
+                else:
+                    LOG.warning("Timed out waiting for core to halt after reset (state is %s)", self.get_state().name)
 
+        # Restore to original state.
+        self.clear_reset_catch(reset_type)
+
+        self._check_t_bit()
+
+    def _check_t_bit(self):
         # Make sure the thumb bit is set in XPSR in case the reset handler
         # points to an invalid address. Only do this if the core is actually halted, otherwise we
         # can't access XPSR.
         if self.get_state() == Target.State.HALTED:
-            xpsr = self.read_core_register('xpsr')
+            xpsr = self.read_core_register_raw('xpsr')
             if xpsr & self.XPSR_THUMB == 0:
-                self.write_core_register('xpsr', xpsr | self.XPSR_THUMB)
-
-        # Restore to original state.
-        self.clear_reset_catch(reset_type)
+                LOG.warning("T bit in XPSR is invalid; the vector table may be invalid or corrupt")
 
     def get_state(self):
         dhcsr = self.read_memory(CortexM.DHCSR)
@@ -927,8 +1163,9 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
     def resume(self):
         """@brief Resume execution of the core.
         """
-        if self.get_state() != Target.State.HALTED:
-            LOG.debug('cannot resume: target not halted')
+        state = self.get_state()
+        if state != Target.State.HALTED:
+            LOG.debug('cannot resume core %d: core is %s', self.core_number, state.name)
             return
         LOG.debug("resuming core %d", self.core_number)
         self.session.notify(Target.Event.PRE_RUN, self, Target.RunType.RESUME)
@@ -953,7 +1190,7 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
                 else:
                     raise KeyError("register %s not available in this CPU", info.name)
 
-    def read_core_register(self, reg):
+    def read_core_register(self, reg: CoreRegisterNameOrNumberType) -> CoreRegisterValueType:
         """@brief Read one core register.
 
         The core must be halted or reads will fail.
@@ -971,7 +1208,7 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         regValue = self.read_core_register_raw(reg_info.index)
         return reg_info.from_raw(regValue)
 
-    def read_core_register_raw(self, reg):
+    def read_core_register_raw(self, reg: CoreRegisterNameOrNumberType) -> int:
         """@brief Read a core register without type conversion.
 
         The core must be halted or reads will fail.
@@ -988,7 +1225,7 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         vals = self.read_core_registers_raw([reg])
         return vals[0]
 
-    def read_core_registers_raw(self, reg_list):
+    def read_core_registers_raw(self, reg_list: Sequence[CoreRegisterNameOrNumberType]) -> List[int]:
         """@brief Read one or more core registers.
 
         The core must be halted or reads will fail.
@@ -1008,7 +1245,7 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         self.check_reg_list(reg_list)
         return self._base_read_core_registers_raw(reg_list)
 
-    def _base_read_core_registers_raw(self, reg_list):
+    def _base_read_core_registers_raw(self, reg_list: List[int]) -> List[int]:
         """@brief Private core register read routine.
 
         Items in the _reg_list_ must be pre-converted to index and only include valid
@@ -1104,7 +1341,7 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
 
         return reg_vals
 
-    def write_core_register(self, reg, data):
+    def write_core_register(self, reg: CoreRegisterNameOrNumberType, data: CoreRegisterValueType) -> None:
         """@brief Write a CPU register.
 
         The core must be halted or the write will fail.
@@ -1120,7 +1357,7 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         reg_info = CortexMCoreRegisterInfo.get(reg)
         self.write_core_register_raw(reg_info.index, reg_info.to_raw(data))
 
-    def write_core_register_raw(self, reg, data):
+    def write_core_register_raw(self, reg: CoreRegisterNameOrNumberType, data: int) -> None:
         """@brief Write a CPU register without type conversion.
 
         The core must be halted or the write will fail.
@@ -1135,7 +1372,7 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         """
         self.write_core_registers_raw([reg], [data])
 
-    def write_core_registers_raw(self, reg_list, data_list):
+    def write_core_registers_raw(self, reg_list: Sequence[CoreRegisterNameOrNumberType], data_list: Sequence[int]) -> None:
         """@brief Write one or more core registers.
 
         The core must be halted or writes will fail.
@@ -1157,7 +1394,7 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         self.check_reg_list(reg_list)
         self._base_write_core_registers_raw(reg_list, data_list)
 
-    def _base_write_core_registers_raw(self, reg_list, data_list):
+    def _base_write_core_registers_raw(self, reg_list: Sequence[int], data_list: Sequence[int]) -> None:
         """@brief Private core register write routine.
 
         Items in the _reg_list_ must be pre-converted to index and only include valid
@@ -1268,7 +1505,7 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
         if self.dwt is not None:
             return self.dwt.set_watchpoint(addr, size, type)
 
-    def remove_watchpoint(self, addr, size, type):
+    def remove_watchpoint(self, addr, size=None, type=None):
         """@brief Remove a hardware watchpoint.
         """
         if self.dwt is not None:
@@ -1320,16 +1557,19 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
             result |= Target.VectorCatch.SECURE_FAULT
         return result
 
-    def set_vector_catch(self, enableMask):
+    def set_vector_catch(self, enable_mask):
+        self._last_vector_catch = enable_mask
         demcr = self.read_memory(CortexM.DEMCR)
-        demcr |= CortexM._map_to_vector_catch_mask(enableMask)
-        demcr &= ~CortexM._map_to_vector_catch_mask(~enableMask)
-        LOG.debug("Setting vector catch to 0x%08x", enableMask)
+        demcr |= CortexM._map_to_vector_catch_mask(enable_mask)
+        demcr &= ~CortexM._map_to_vector_catch_mask(~enable_mask)
+        LOG.debug("Setting vector catch to 0x%08x", enable_mask)
         self.write_memory(CortexM.DEMCR, demcr)
 
     def get_vector_catch(self):
         demcr = self.read_memory(CortexM.DEMCR)
-        return CortexM._map_from_vector_catch_mask(demcr)
+        mask = CortexM._map_from_vector_catch_mask(demcr)
+        self._last_vector_catch = mask
+        return mask
 
     def is_debug_trap(self):
         debugEvents = self.read_memory(CortexM.DFSR) & (CortexM.DFSR_DWTTRAP | CortexM.DFSR_BKPT | CortexM.DFSR_HALTED)
@@ -1384,12 +1624,9 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
            "SysTick",
     ]
 
-    def exception_number_to_name(self, exc_num: int, name_thread: bool = False) -> Optional[str]:
+    def exception_number_to_name(self, exc_num: int) -> Optional[str]:
         if exc_num < len(self.CORE_EXCEPTION):
-            if exc_num == 0 and not name_thread:
-                return None
-            else:
-                return self.CORE_EXCEPTION[exc_num]
+            return self.CORE_EXCEPTION[exc_num]
         else:
             irq_num = exc_num - len(self.CORE_EXCEPTION)
             name = None
@@ -1404,5 +1641,5 @@ class CortexM(CoreTarget, CoreSightCoreComponent): # lgtm[py/multiple-calls-to-i
     def in_thread_mode_on_main_stack(self) -> bool:
         if not self._target_context:
             return False
-        return (self._target_context.read_core_register('ipsr') == 0 and
-                (self._target_context.read_core_register('control') & CortexM.CONTROL_SPSEL) == 0)
+        return (self._target_context.read_core_register_raw('ipsr') == 0 and
+                (self._target_context.read_core_register_raw('control') & CortexM.CONTROL_SPSEL) == 0)

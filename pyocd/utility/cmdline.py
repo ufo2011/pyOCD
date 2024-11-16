@@ -1,6 +1,6 @@
 # pyOCD debugger
 # Copyright (c) 2015-2020 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2021-2022 Chris Reed
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,7 @@
 # limitations under the License.
 
 import logging
-from typing import (Any, Dict, Iterable, List, Optional, Union)
+from typing import (Any, Callable, Dict, Iterable, List, Optional, Tuple, Union, cast)
 
 from ..core.target import Target
 from ..core.options import OPTIONS_INFO
@@ -128,6 +128,99 @@ def convert_vector_catch(vcvalue: Union[str, bytes]) -> int:
         # Reraise an error with a more helpful message.
         raise ValueError("invalid vector catch option '{}'".format(e.args[0]))
 
+def _convert_string_list_option(value: Optional[str]) -> List[str]:
+    """@brief Convert a comma-separated list of strings.
+
+    A None value results in an empty list.
+
+    No special support for quoted values is provided, so a comma in between quotes is treated
+    the same as a comma elsewhere.
+    """
+    if value is None:
+        return []
+    return [
+        i.strip()
+        for i in value.split(',')
+    ]
+
+## Map with special converter routines for session options that need them.
+_OPTION_CONVERTERS: Dict[str, Callable[[Optional[str]], Any]] = {
+    'pack.debug_sequences.disabled_sequences': _convert_string_list_option,
+}
+
+def convert_one_session_option(name: str, value: Optional[str]) -> Tuple[str, Any]:
+    """@brief Convert one session option's value from a string.
+
+    Handles "no-" prefixed option names by inverting their boolean value. If a non-boolean option has
+    a "no-" prefix, then a warning is logged and None returned for the value.
+
+    @return Bi-tuple of option name, converted value. The option name may be modified from the one passed
+        in for cases like a "no-" prefix.
+    """
+    # Check for and strip "no-" prefix before we validate the option name.
+    if name.startswith('no-'):
+        name = name[3:]
+        had_no_prefix = True
+    else:
+        had_no_prefix = False
+
+    # Look up this option.
+    try:
+        info = OPTIONS_INFO[name]
+    except KeyError:
+        # Return the value unmodified for unknown options.
+        LOG.warning("unknown session option '%s'", name)
+        return name, value
+
+    # Check if "no-" prefix is allowed. Only bool options can use it.
+    if had_no_prefix and (info.type is not bool):
+        LOG.warning("'no-' prefix used on non-boolean session option '%s'", name)
+        return name, None
+
+    # Check for a special converter function.
+    if name in _OPTION_CONVERTERS:
+        return name, _OPTION_CONVERTERS[name](value)
+
+    # Default result; unset option value.
+    result = None
+
+    # Extract the option's type. If its type is a tuple of types, then take the first type.
+    if isinstance(info.type, tuple):
+        option_type = cast(tuple, info.type)[0]
+    else:
+        option_type = info.type
+
+    # Handle bool options without a value specially.
+    if value is None:
+        if issubclass(option_type, bool):
+            result = not had_no_prefix
+        else:
+            LOG.warning("non-boolean option '%s' requires a value", name)
+    # Convert string value to option type.
+    elif issubclass(option_type, bool):
+        if value.lower() in ("true", "1", "yes", "on", "false", "0", "no", "off"):
+            result = value.lower() in ("true", "1", "yes", "on")
+
+            # If a bool option with "no-" prefix has a value, the value is inverted.
+            if had_no_prefix:
+                result = not result
+        else:
+            LOG.warning("invalid value for option '%s'", name)
+    elif issubclass(option_type, int):
+        try:
+            result = int(value, base=0)
+        except ValueError:
+            LOG.warning("invalid value for option '%s'", name)
+    elif issubclass(option_type, float):
+        try:
+            result = float(value)
+        except ValueError:
+            LOG.warning("invalid value for option '%s'", name)
+    else:
+        result = value
+
+    return name, result
+
 def convert_session_options(option_list: Iterable[str]) -> Dict[str, Any]:
     """@brief Convert a list of session option settings to a dictionary."""
     options = {}
@@ -141,48 +234,9 @@ def convert_session_options(option_list: Iterable[str]) -> Dict[str, Any]:
                 name = o.strip().lower()
                 value = None
 
-            # Check for and strip "no-" prefix before we validate the option name.
-            if (value is None) and (name.startswith('no-')):
-                name = name[3:]
-                had_no_prefix = True
-            else:
-                had_no_prefix = False
-
-            # Look for this option.
-            try:
-                info = OPTIONS_INFO[name]
-            except KeyError:
-                LOG.warning("ignoring unknown session option '%s'", name)
-                continue
-
-            # Handle bool options without a value specially.
-            if value is None:
-                if info.type is bool:
-                    value = not had_no_prefix
-                else:
-                    LOG.warning("non-boolean option '%s' requires a value", name)
-                    continue
-            # Convert string value to option type.
-            elif info.type is bool:
-                if value.lower() in ("true", "1", "yes", "on", "false", "0", "no", "off"):
-                    value = value.lower() in ("true", "1", "yes", "on")
-                else:
-                    LOG.warning("invalid value for option '%s'", name)
-                    continue
-            elif info.type is int:
-                try:
-                    value = int(value, base=0)
-                except ValueError:
-                    LOG.warning("invalid value for option '%s'", name)
-                    continue
-            elif info.type is float:
-                try:
-                    value = float(value)
-                except ValueError:
-                    LOG.warning("invalid value for option '%s'", name)
-                    continue
-
-            options[name] = value
+            name, value = convert_one_session_option(name, value)
+            if value is not None:
+                options[name] = value
     return options
 
 ## Map to convert from reset type names to enums.
@@ -192,9 +246,13 @@ RESET_TYPE_MAP: Dict[str, Optional[Target.ResetType]] = {
         'sw': Target.ResetType.SW,
         'hardware': Target.ResetType.HW,
         'software': Target.ResetType.SW,
+        'sw_system': Target.ResetType.SW_SYSTEM,
+        'sw_core': Target.ResetType.SW_CORE,
         'sw_sysresetreq': Target.ResetType.SW_SYSRESETREQ,
         'sw_vectreset': Target.ResetType.SW_VECTRESET,
         'sw_emulated': Target.ResetType.SW_EMULATED,
+        'system': Target.ResetType.SW_SYSTEM,
+        'core': Target.ResetType.SW_CORE,
         'sysresetreq': Target.ResetType.SW_SYSRESETREQ,
         'vectreset': Target.ResetType.SW_VECTRESET,
         'emulated': Target.ResetType.SW_EMULATED,

@@ -22,7 +22,7 @@ from time import sleep
 import sys
 import io
 from xml.etree.ElementTree import (Element, SubElement, tostring)
-from typing import (Dict, List, Optional)
+from typing import (Dict, List, Optional, Tuple)
 
 from ..core import exceptions
 from ..core.target import Target
@@ -33,6 +33,7 @@ from ..utility.compatibility import (to_bytes_safe, to_str_safe)
 from ..utility.server import StreamServer
 from ..utility.timeout import Timeout
 from ..trace.swv import SWVReader
+from ..utility.rtt_server import RTTServer
 from ..utility.sockets import ListenerSocket
 from .syscall import GDBSyscallIOHandler
 from ..debug import semihost
@@ -94,10 +95,6 @@ def escape(data):
             result.append(c)
     return bytes(result)
 
-class GDBError(exceptions.Error):
-    """@brief Error communicating with GDB."""
-    pass
-
 class GDBServer(threading.Thread):
     """@brief GDB remote server thread.
 
@@ -139,6 +136,8 @@ class GDBServer(threading.Thread):
         self.semihost_use_syscalls = session.options.get('semihost_use_syscalls') # Not subscribed.
         self.serve_local_only = session.options.get('serve_local_only') # Not subscribed.
         self.report_core = session.options.get('report_core_number')
+        self.soft_bkpt_as_hard = session.options.get('soft_bkpt_as_hard')
+
         # Subscribe to changes for those of the above options that make sense to change at runtime.
         self.session.options.subscribe(self._option_did_change, [
                 'vector_catch',
@@ -146,6 +145,7 @@ class GDBServer(threading.Thread):
                 'persist',
                 'enable_semihosting',
                 'report_core_number',
+                'soft_bkpt_as_hard',
                 ])
 
         self.packet_size = 2048
@@ -198,6 +198,9 @@ class GDBServer(threading.Thread):
             self.telnet_server = None
             semihost_console = semihost_io_handler
         self.semihost = semihost.SemihostAgent(self.target_context, io_handler=semihost_io_handler, console=semihost_console)
+
+        # Start with RTT disabled
+        self.rtt_server: Optional[RTTServer] = None
 
         #
         # If SWV is enabled, create a SWVReader thread. Note that we only do
@@ -299,6 +302,9 @@ class GDBServer(threading.Thread):
         if self._swv_reader:
             self._swv_reader.stop()
             self._swv_reader = None
+        if self.rtt_server:
+            self.rtt_server.stop()
+            self.rtt_server = None
         self.abstract_socket.cleanup()
 
     def _cleanup_for_next_connection(self):
@@ -413,8 +419,8 @@ class GDBServer(threading.Thread):
             try:
                 handler, msgStart = self.COMMANDS[msg[1:2]]
             except (KeyError, IndexError):
-                LOG.error("Unknown RSP packet: %s", msg)
-                return self.create_rsp_packet(b""), 0
+                LOG.error("Unknown RSP command (%s)", msg[1:2])
+                return self.create_rsp_packet(b"")
 
             with self.lock:
                 if msgStart == 0:
@@ -427,7 +433,7 @@ class GDBServer(threading.Thread):
         except Exception as e:
             LOG.error("Unhandled exception in handle_message (%s): %s",
                     msg[1:2], e, exc_info=self.session.log_tracebacks)
-            return self.create_rsp_packet(b"E01"), 0
+            return self.create_rsp_packet(b"E01")
 
     def extended_remote(self):
         LOG.debug("extended remote enabled")
@@ -461,7 +467,8 @@ class GDBServer(threading.Thread):
         # handle software breakpoint Z0/z0
         if data[1:2] == b'0':
             if data[0:1] == b'Z':
-                if not self.target.set_breakpoint(addr, Target.BreakpointType.SW):
+                bkpt_type = Target.BreakpointType.HW if self.soft_bkpt_as_hard else Target.BreakpointType.SW
+                if not self.target.set_breakpoint(addr, bkpt_type):
                     return self.create_rsp_packet(b'E01') #EPERM
             else:
                 self.target.remove_breakpoint(addr)
@@ -612,7 +619,7 @@ class GDBServer(threading.Thread):
                     # Note: if the target is not actually halted, gdb can get confused from this point on.
                     # But there's not much we can do if we're getting faults attempting to control it.
                     if not fault_retry_timeout.is_running:
-                        LOG.error('Exception reading target status: %s', e, exc_info=self.session.log_tracebacks)
+                        LOG.error('Error reading target status: %s', e, exc_info=self.session.log_tracebacks)
                     val = ('S%02x' % signals.SIGINT).encode()
                 break
 
@@ -620,6 +627,9 @@ class GDBServer(threading.Thread):
 
             try:
                 state = self.target.get_state()
+
+                if self.rtt_server:
+                    self.rtt_server.poll()
 
                 # If we were able to successfully read the target state after previously receiving a fault,
                 # then clear the timeout.
@@ -653,7 +663,7 @@ class GDBServer(threading.Thread):
                     self.target.halt()
                 except exceptions.Error:
                     pass
-                LOG.warning('Exception while target was running: %s', e, exc_info=self.session.log_tracebacks)
+                LOG.warning('Error while target was running: %s', e, exc_info=self.session.log_tracebacks)
                 # This exception was not a transfer error, so reading the target state should be ok.
                 val = ('S%02x' % self.target_facade.get_signal_value()).encode()
                 break
@@ -934,26 +944,15 @@ class GDBServer(threading.Thread):
             return self.create_rsp_packet(resp)
 
         elif query[0] == b'Xfer':
-
-            if query[1] == b'features' and query[2] == b'read' and \
-               query[3] == b'target.xml':
+            # qXfer:<object>:read:<annex>:<offset>,<length>
+            if query[2] == b'read':
                 data = query[4].split(b',')
-                resp = self.handle_query_xml(b'read_feature', int(data[0], 16), int(data[1].split(b'#')[0], 16))
+                resp = self.handle_query_xml(query[1], query[3], int(data[0], 16), int(data[1].split(b'#')[0], 16))
                 return self.create_rsp_packet(resp)
-
-            elif query[1] == b'memory-map' and query[2] == b'read':
-                data = query[4].split(b',')
-                resp = self.handle_query_xml(b'memory_map', int(data[0], 16), int(data[1].split(b'#')[0], 16))
-                return self.create_rsp_packet(resp)
-
-            elif query[1] == b'threads' and query[2] == b'read':
-                data = query[4].split(b',')
-                resp = self.handle_query_xml(b'threads', int(data[0], 16), int(data[1].split(b'#')[0], 16))
-                return self.create_rsp_packet(resp)
-
             else:
                 LOG.debug("Unsupported qXfer request: %s:%s:%s:%s", query[1], query[2], query[3], query[4])
-                return None
+                # Must return an empty packet for an unrecognized qXfer.
+                return self.create_rsp_packet(b"")
 
         elif query[0].startswith(b'C'):
             if not self.is_threading_enabled():
@@ -1020,29 +1019,35 @@ class GDBServer(threading.Thread):
         # Done with symbol processing.
         return self.create_rsp_packet(b"OK")
 
-    def get_symbol(self, name):
+    def get_symbol(self, name: bytes) -> Optional[int]:
+        assert self.packet_io
+
         # Send the symbol request.
         request = self.create_rsp_packet(b'qSymbol:' + hex_encode(name))
         self.packet_io.send(request)
 
         # Read a packet.
         packet = self.packet_io.receive()
+        assert packet is not None
 
         # Parse symbol value reply packet.
         packet = packet[1:-3]
         if not packet.startswith(b'qSymbol:'):
-            raise GDBError("Got unexpected response from gdb when asking for symbol value")
+            LOG.error("Got unexpected response from gdb when asking for symbol value")
+            return None
         packet = packet[8:]
-        symValue, symName = packet.split(b':')
+        sym_value, sym_name = packet.split(b':')
 
-        symName = hex_decode(symName)
-        if symName != name:
-            raise GDBError("Symbol value reply from gdb has unexpected symbol name")
-        if symValue:
-            symValue = hex8_to_u32le(symValue)
+        sym_name = hex_decode(sym_name)
+        if sym_name != name:
+            LOG.error("Symbol value reply from gdb has unexpected symbol name (expected '%s', received '%s')",
+                    name, sym_name)
+            return None
+        if sym_value:
+            sym_value = hex8_to_u32le(sym_value)
         else:
             return None
-        return symValue
+        return sym_value
 
     def handle_remote_command(self, cmd):
         """@brief Pass remote commands to the commander command processor."""
@@ -1068,7 +1073,7 @@ class GDBServer(threading.Thread):
                     exc_info=self.session.log_tracebacks)
         except Exception as err:
             stream.write("Unexpected error: %s\n" % err)
-            LOG.error("Exception while executing remote command '%s': %s", cmd, err,
+            LOG.error("Error while executing remote command '%s': %s", cmd, err,
                     exc_info=self.session.log_tracebacks)
 
         # Convert back to bytes, hex encode, then return the response packet.
@@ -1099,24 +1104,36 @@ class GDBServer(threading.Thread):
         else:
             return self.create_rsp_packet(b"")
 
-    def handle_query_xml(self, query, offset, size):
-        LOG.debug('GDB query %s: offset: %s, size: %s', query, offset, size)
-        xml = ''
-        if query == b'memory_map':
+    def handle_query_xml(self, query: bytes, annex: bytes, offset: int, size: int) -> bytes:
+        LOG.debug('GDB query %s: annex: %s, offset: %s, size: %s', query, annex, offset, size)
+
+        # For each query object, we check the annex and return E00 for invalid values. Only 'features'
+        # has a non-empty annex.
+        if query == b'memory-map':
+            if annex != b'':
+                return self.create_rsp_packet(b"E00")
             xml = self.target_facade.get_memory_map_xml()
-        elif query == b'read_feature':
-            xml = self.target_facade.get_target_xml()
+        elif query == b'features':
+            if annex == b'target.xml':
+                xml = self.target_facade.get_target_xml()
+            else:
+                return self.create_rsp_packet(b"E00")
         elif query == b'threads':
+            if annex != b'':
+                return self.create_rsp_packet(b"E00")
             xml = self.get_threads_xml()
         else:
-            raise GDBError("Invalid XML query (%s)" % query)
+            # Unrecognised query object, so return empty packet.
+            LOG.debug("Unsupported XML query (%s), annex (%s)", query, annex)
+            return self.create_rsp_packet(b"")
 
         size_xml = len(xml)
 
         prefix = b'm'
 
         if offset > size_xml:
-            raise GDBError('GDB: xml offset > size for %s!', query)
+            LOG.error('GDB requested xml offset > size for %s!', query)
+            return self.create_rsp_packet(b"E16") # EINVAL
 
         if size > (self.packet_size - 4):
             size = self.packet_size - 4
@@ -1131,15 +1148,13 @@ class GDBServer(threading.Thread):
 
         return resp
 
-
     def create_rsp_packet(self, data):
         resp = b'$' + data + b'#' + checksum(data)
         return resp
 
-    def syscall(self, op):
-        op = to_bytes_safe(op)
+    def syscall(self, op: str) -> Tuple[int, int]:
         LOG.debug("GDB server syscall: %s", op)
-        request = self.create_rsp_packet(b'F' + op)
+        request = self.create_rsp_packet(b'F' + op.encode())
         self.packet_io.send(request)
 
         while not self.packet_io.interrupt_event.is_set():
@@ -1255,4 +1270,5 @@ class GDBServer(threading.Thread):
             LOG.info("Semihosting %s", ('enabled' if self.enable_semihosting else 'disabled'))
         elif notification.event == 'report_core_number':
             self.report_core = notification.data.new_value
-
+        elif notification.event == 'soft_bkpt_as_hard':
+            self.soft_bkpt_as_hard = notification.data.new_value

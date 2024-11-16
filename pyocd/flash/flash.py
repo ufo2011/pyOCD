@@ -1,6 +1,7 @@
 # pyOCD debugger
 # Copyright (c) 2013-2020 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2021-2022 Chris Reed
+# Copyright (c) 2023 Nordic Semiconductor ASA
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 import logging
 from enum import Enum
 
+from ..core import exceptions
 from ..core.target import Target
 from ..core.exceptions import (FlashFailure, FlashEraseFailure, FlashProgramFailure)
 from ..utility.mask import (align_down, msb)
@@ -83,7 +85,7 @@ class Flash:
         passed to the ProgramPage() flash algo API. Pages must be the same size or smaller than
         sectors.
     - phrase: The minimum programming granularity, often from 1-16 bytes. For some flash
-        technologies, the is no distinction between a phrase and a page.
+        technologies, there is no distinction between a phrase and a page.
 
     The `flash_algo` parameter of the constructor is a dictionary that defines all the details
     of the flash algorithm. The keys of this dictionary are as follows.
@@ -122,6 +124,9 @@ class Flash:
     # as unsigned.
     TIMEOUT_ERROR = -1
 
+    ## Canary value used for checking stack overflow.
+    _STACK_CANARY = 0xdeadf00d
+
     def __init__(self, target, flash_algo):
         self.target = target
         self.flash_algo = flash_algo
@@ -137,6 +142,7 @@ class Flash:
             self.begin_data = flash_algo['begin_data']
             self.static_base = flash_algo['static_base']
             self.min_program_length = flash_algo.get('min_program_length', 0)
+            self.end_stack = flash_algo.get('end_stack')
 
             # Validate required APIs.
             assert self._is_api_valid('pc_erase_sector')
@@ -229,11 +235,15 @@ class Flash:
             TRACE.debug("algo init and load to %#010x", self.flash_algo['load_address'])
 
             if reset:
-                self.target.reset_and_halt(Target.ResetType.SW)
+                self.target.reset_and_halt()
             self.prepare_target()
 
             # Load flash algo code into target RAM.
             self.target.write_memory_block32(self.flash_algo['load_address'], self.flash_algo['instructions'])
+
+            # Write stack canary if we know the expected end of stack address.
+            if self.end_stack is not None:
+                self.target.write32(self.end_stack, self._STACK_CANARY)
 
             self._did_prepare_target = True
 
@@ -398,14 +408,16 @@ class Flash:
     def start_program_page_with_buffer(self, buffer_number, address):
         """@brief Start flashing one or more pages.
         """
-        assert self.region is not None
         assert buffer_number < len(self.page_buffers), "Invalid buffer number"
         assert self._active_operation == self.Operation.PROGRAM
 
+        page_info = self.get_page_info(address)
+        assert page_info
+
         # update core register to execute the program_page subroutine
-        TRACE.debug("start_program_page_with_buffer(addr=%x, len=%x, data=%x)", address, self.region.page_size,
+        TRACE.debug("start_program_page_with_buffer(addr=%x, len=%x, data=%x)", address, page_info.size,
                 self.page_buffers[buffer_number])
-        self._call_function(self.flash_algo['pc_program_page'], address, self.region.page_size, self.page_buffers[buffer_number])
+        self._call_function(self.flash_algo['pc_program_page'], address, page_info.size, self.page_buffers[buffer_number])
 
     def load_page_buffer(self, buffer_number, address, bytes):
         """@brief Load data to a numbered page buffer.
@@ -456,31 +468,45 @@ class Flash:
         elif result != 0:
             raise FlashProgramFailure('flash program phrase failure', address=address, result_code=result)
 
-    def get_sector_info(self, addr):
-        """@brief Get info about the sector that contains this address.
-        """
+    def _get_region_or_subregion(self, addr: int):
         assert self.region is not None
         if not self.region.contains_address(addr):
             return None
 
+        region = None
+        if self.region.has_subregions:
+            region = self.region.submap.get_region_for_address(addr)
+
+        if not region:
+            region = self.region
+
+        return region
+
+    def get_sector_info(self, addr):
+        """@brief Get info about the sector that contains this address.
+        """
+        region = self._get_region_or_subregion(addr)
+        if region is None:
+            return None
+
         info = SectorInfo(
-                erase_weight=self.region.erase_sector_weight,
-                size=self.region.sector_size,
-                base_addr=align_down(addr, self.region.sector_size),
+                erase_weight=region.erase_sector_weight,
+                size=region.sector_size,
+                base_addr=align_down(addr, region.sector_size),
                 )
         return info
 
     def get_page_info(self, addr):
         """@brief Get info about the page that contains this address.
         """
-        assert self.region is not None
-        if not self.region.contains_address(addr):
+        region = self._get_region_or_subregion(addr)
+        if region is None:
             return None
 
         info = PageInfo(
-                program_weight=self.region.program_page_weight,
-                size=self.region.page_size,
-                base_addr=align_down(addr, self.region.page_size)
+                program_weight=region.program_page_weight,
+                size=region.page_size,
+                base_addr=align_down(addr, region.page_size)
                 )
         return info
 
@@ -578,15 +604,15 @@ class Flash:
             error = True
         if final_fp != expected_fp:
             # Frame pointer should not change
-            LOG.error("Frame pointer should be 0x%x but is 0x%x" % (expected_fp, final_fp))
+            LOG.error("Frame pointer should be 0x%x but is 0x%x", expected_fp, final_fp)
             error = True
         if final_sp != expected_sp:
             # Stack pointer should return to original value after function call
-            LOG.error("Stack pointer should be 0x%x but is 0x%x" % (expected_sp, final_sp))
+            LOG.error("Stack pointer should be 0x%x but is 0x%x", expected_sp, final_sp)
             error = True
         if final_pc != expected_pc:
             # PC should be pointing to breakpoint address
-            LOG.error("PC should be 0x%x but is 0x%x" % (expected_pc, final_pc))
+            LOG.error("PC should be 0x%x but is 0x%x", expected_pc, final_pc)
             error = True
         #TODO - uncomment if Read/write and zero init sections can be moved into a separate flash algo section
         #if not _same(expected_flash_algo, final_flash_algo):
@@ -600,18 +626,48 @@ class Flash:
 
     def wait_for_completion(self, timeout=None):
         """@brief Wait until the breakpoint is hit.
+
+        Checks for:
+        - Timeout, using the _timeout_ parameter.
+        - The target is halted after executing the flash operation.
+        - Stack overflow.
         """
+        # TODO Commonise the method to report timeout, halted, and stack canary errors resulting from here.
+
+        # This setting of state isn't strictly necessary, but pyright sees it as possibly unbound when used
+        # below. Otoh, lgtm sees it as unnecessary! So we disable the lgtm warning.
+        state = Target.State.RUNNING # lgtm[py/multiple-definition]
         with Timeout(timeout) as time_out:
             while time_out.check():
-                if self.target.get_state() != Target.State.RUNNING:
-                    break
+                try:
+                    state = self.target.get_state()
+                    if state != Target.State.RUNNING:
+                        break
+                except exceptions.TransferTimeoutError:
+                    LOG.debug("target.get_state probe timeout")
+                except exceptions.TransferFaultError:
+                    LOG.debug("target.get_state probe fault")
             else:
                 # Operation timed out.
                 self.target.halt()
+                ipsr = self.target.read_core_register('ipsr')
+                LOG.debug("flash operation timed out; IPSR=%d", ipsr)
                 return self.TIMEOUT_ERROR
 
         if self.flash_algo_debug:
             self._flash_algo_debug_check()
+
+        if state != Target.State.HALTED:
+            self.target.halt()
+            ipsr = self.target.read_core_register('ipsr')
+            raise exceptions.FlashFailure("target was not halted as expected after calling "
+                                          f"flash algorithm routine (IPSR={ipsr})")
+
+        # Check stack canary if we have one.
+        if self.end_stack is not None:
+            canary = self.target.read32(self.end_stack)
+            if canary != self._STACK_CANARY:
+                raise exceptions.FlashFailure(f"flash algorithm overflowed stack ({self.begin_stack - self.end_stack} bytes)")
 
         return self.target.read_core_register('r0')
 

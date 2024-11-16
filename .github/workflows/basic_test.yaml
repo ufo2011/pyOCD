@@ -1,55 +1,75 @@
+# Copyright (c) 2021-2022 Chris Reed
+
 # pyocd workflow for:
 # - checking code with flake8
 # - running unit tests
+# - run test/import_all.py script
+# - build source distro and wheel, check with twine
 
 name: basic test
 
-on: [push, pull_request]
+# Don't run for changes that only affect the docs directory.
+on:
+  push:
+    paths-ignore:
+      - 'docs/**'
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os:
+        - ubuntu-latest
+        - macos-latest
+        - windows-latest
         python-version:
-        - 3.6
-        - 3.7
-        - 3.8
-        - 3.9
+        - "3.7"
+        - "3.8"
+        - "3.9"
         - "3.10"
+        - "3.11"
+        exclude:
+          - os: macos-latest
+            python-version: "3.7"
 
     steps:
-    - uses: actions/checkout@v2
+    # Only check out HEAD. We don't need the full history.
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 1
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python-version }}
 
-    # This requires pip 20.1+. The current ubuntu-latest as of 28 Feb 2021 has pip 21.0.1 by default
-    # for all Python versions 3.6-3.9.
+    # This requires pip 20.1+. As of 28 Feb 2021 this condition is met for all supported
+    # Python versions on all OSes.
     - name: Get pip cache dir
       id: pip-cache
       run: |
         echo "::set-output name=dir::$(pip cache dir)"
 
     - name: Setup pip cache
-      uses: actions/cache@v2
+      uses: actions/cache@v3
       with:
         path: ${{ steps.pip-cache.outputs.dir }}
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/dev-requirements.txt', '**/setup.py') }}
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/setup.cfg') }}
         restore-keys: |
           ${{ runner.os }}-pip-
 
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade setuptools pip wheel
+        python -m pip install --upgrade setuptools pip wheel build twine
         pip install -e .[test]
 
     - name: Setup flake8 annotations
-      # This commit is v1. Using exact commit for security.
-      uses: rbialon/flake8-annotations@f8c29dc2e054df26e0171b0005e99454f7db57a0
+      # This commit is v1.1. Using exact commit for security.
+      uses: rbialon/flake8-annotations@48819b39d57c621b5a64a1cdce40a5caa6a43b89
 
     # Stop the build if there are Python syntax errors or undefined names.
     - name: Lint with flake8
@@ -58,7 +78,7 @@ jobs:
 
     - name: Test with pytest
       run: |
-        pytest --junitxml=test-results-${{ matrix.python-version }}.xml --cov=pyocd --cov-report=xml
+        pytest --junitxml=test-results-${{ matrix.os }}-${{ matrix.python-version }}.xml --cov=pyocd
 
     - name: Test importing all modules
       run: |
@@ -66,14 +86,18 @@ jobs:
 
     - name: Test build
       run: |
-        python setup.py sdist bdist_wheel
+        python -mbuild
+
+    - name: Check packages
+      run: |
+        twine check dist/*
 
     - name: Upload pytest test results
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v3
       with:
         name: pytest-results-${{ matrix.python-version }}
         path: |
-          test-results-${{ matrix.python-version }}.xml
-          coverage.xml
+          test-results-${{ matrix.os }}-${{ matrix.python-version }}.xml
+          .coverage*
       # Use always() to always run this step to publish test results when there are test failures
       if: ${{ always() }}

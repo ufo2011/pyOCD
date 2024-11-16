@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import (Callable, Optional, NamedTuple, Union, TYPE_CHECKING)
+from typing import (Callable, Dict, Optional, NamedTuple, Tuple, Union, TYPE_CHECKING)
 
 from .ap import (APAddressBase, AccessPort)
 from .cortex_m import CortexM
@@ -26,6 +26,7 @@ from .itm import ITM
 from .tpiu import TPIU
 from .gpr import GPR
 from .sdc600 import SDC600
+from .funnel import TraceFunnel
 
 if TYPE_CHECKING:
     from .component import CoreSightComponent
@@ -42,7 +43,17 @@ SYSTEM_CLASS = 0xf # CoreLink, PrimeCell, or other system component with no stan
 #  [11:8] continuation
 #  [6:0]  ID
 ARM_ID = 0x43b
+ARM_CHINA_ID = 0xa75
 FSL_ID = 0x00e
+STM_ID = 0x020
+
+## Map of JEP106 IDs to vendor name.
+VENDOR_NAMES_MAP: Dict[int, str] = {
+    ARM_ID: "Arm",
+    ARM_CHINA_ID: "Arm China",
+    FSL_ID: "NXP",
+    STM_ID: "ST",
+}
 
 # CoreSight devtype
 #  Major Type [3:0]
@@ -81,7 +92,7 @@ class CmpInfo(NamedTuple):
     factory: Optional[Union[ComponentFactory, APFactory]]
 
 ## Map from (designer, class, part, devtype, archid) to component name, product name, and factory.
-COMPONENT_MAP = {
+COMPONENT_MAP: Dict[Tuple[int, int, Optional[int], Optional[int], int], CmpInfo] = {
   # Archid-only entries
   # Designer|Component Class |Part  |Type |Archid           |Name              |Product    |Factory
     (ARM_ID, CORESIGHT_CLASS, None,  None, 0x0a00) : CmpInfo('RASv1',           None,       None                ),
@@ -108,11 +119,14 @@ COMPONENT_MAP = {
   # Full ID entries
   # Designer|Component Class |Part  |Type |Archid           |Name              |Product    |Factory
     (ARM_ID, CORESIGHT_CLASS, 0x193, 0x00, 0x0a57) : CmpInfo('TSGEN',           'CS-600',   None                ),
-    (ARM_ID, CORESIGHT_CLASS, 0x906, 0x14, 0)      : CmpInfo('CTI',             None,       None                ),
-    (ARM_ID, CORESIGHT_CLASS, 0x907, 0x21, 0)      : CmpInfo('ETB',             None,       None                ),
-    (ARM_ID, CORESIGHT_CLASS, 0x908, 0x12, 0)      : CmpInfo('CSTF',            None,       None                ),
-    (ARM_ID, CORESIGHT_CLASS, 0x912, 0x11, 0)      : CmpInfo('TPIU',            None,       TPIU.factory        ),
+    (ARM_ID, CORESIGHT_CLASS, 0x906, 0x14, 0)      : CmpInfo('CTI',             'CS-400',   None                ),
+    (ARM_ID, CORESIGHT_CLASS, 0x907, 0x21, 0)      : CmpInfo('ETB',             'CS-400',   None                ),
+    (ARM_ID, CORESIGHT_CLASS, 0x908, 0x12, 0)      : CmpInfo('Trace Funnel',    'CS-400',   TraceFunnel.factory ),
+    (ARM_ID, CORESIGHT_CLASS, 0x909, 0x22, 0)      : CmpInfo('Trace Replicator',None,       None                ),
+    (ARM_ID, CORESIGHT_CLASS, 0x912, 0x11, 0)      : CmpInfo('TPIU',            'CS-400',   TPIU.factory        ),
+    (ARM_ID, CORESIGHT_CLASS, 0x913, 0x43, 0)      : CmpInfo('ITM',             'CS-400',   None                ),
     (ARM_ID, CORESIGHT_CLASS, 0x914, 0x11, 0)      : CmpInfo('SWO',             'CS-400',   TPIU.factory        ),
+    (ARM_ID, CORESIGHT_CLASS, 0x917, 0x43, 0)      : CmpInfo('HTM',             'CS-400',   None                ),
     (ARM_ID, CORESIGHT_CLASS, 0x923, 0x11, 0)      : CmpInfo('TPIU',            'M3',       TPIU.factory        ),
     (ARM_ID, CORESIGHT_CLASS, 0x924, 0x13, 0)      : CmpInfo('ETM',             'M3',       None                ),
     (ARM_ID, CORESIGHT_CLASS, 0x925, 0x13, 0)      : CmpInfo('ETM',             'M4',       None                ),
@@ -122,6 +136,7 @@ COMPONENT_MAP = {
     (ARM_ID, CORESIGHT_CLASS, 0x950, 0x13, 0)      : CmpInfo('PTM',             'A9',       None                ),
     (ARM_ID, CORESIGHT_CLASS, 0x961, 0x32, 0)      : CmpInfo('ETF',             None,       None                ), # Trace Memory Controller ETF
     (ARM_ID, CORESIGHT_CLASS, 0x962, 0x63, 0x0a63) : CmpInfo('STM',             None,       None                ), # System Trace Macrocell
+    (ARM_ID, CORESIGHT_CLASS, 0x962, 0x63, 0)      : CmpInfo('STM',             None,       None                ), # System Trace Macrocell (archid=0)
     (ARM_ID, CORESIGHT_CLASS, 0x963, 0x63, 0x0a63) : CmpInfo('STM-500',         None,       None                ), # System Trace Macrocell
     (ARM_ID, CORESIGHT_CLASS, 0x975, 0x13, 0x4a13) : CmpInfo('ETM',             'M7',       None                ),
     (ARM_ID, CORESIGHT_CLASS, 0x9a0, 0x16, 0)      : CmpInfo('PMU',             'A9',       None                ),
@@ -145,7 +160,7 @@ COMPONENT_MAP = {
     (ARM_ID, CORESIGHT_CLASS, 0x9e8, 0x21, 0)      : CmpInfo('ETR',             'CS-600',   None                ),
     (ARM_ID, CORESIGHT_CLASS, 0x9e9, 0x21, 0)      : CmpInfo('ETB',             'CS-600',   None                ),
     (ARM_ID, CORESIGHT_CLASS, 0x9ea, 0x32, 0)      : CmpInfo('ETF',             'CS-600',   None                ),
-    (ARM_ID, CORESIGHT_CLASS, 0x9eb, 0x12, 0)      : CmpInfo('ATB Funnel',      'CS-600',   None                ),
+    (ARM_ID, CORESIGHT_CLASS, 0x9eb, 0x12, 0)      : CmpInfo('ATB Funnel',      'CS-600',   TraceFunnel.factory ),
     (ARM_ID, CORESIGHT_CLASS, 0x9ec, 0x22, 0)      : CmpInfo('ATB Replicator',  'CS-600',   None                ),
     (ARM_ID, CORESIGHT_CLASS, 0x9ed, 0x14, 0x1a14) : CmpInfo('CTI',             'CS-600',   None                ),
     (ARM_ID, CORESIGHT_CLASS, 0x9ee, 0x00, 0)      : CmpInfo('CATU',            'CS-600',   None                ),
@@ -184,13 +199,24 @@ COMPONENT_MAP = {
     (ARM_ID, CORESIGHT_CLASS, 0xd21, 0x00, 0x2a04) : CmpInfo('SCS',             'M33',      CortexM_v8M.factory ),
     (ARM_ID, CORESIGHT_CLASS, 0xd21, 0x13, 0x4a13) : CmpInfo('ETM',             'M33',      None                ),
     (ARM_ID, CORESIGHT_CLASS, 0xd21, 0x11, 0)      : CmpInfo('TPIU',            'M33',      TPIU.factory        ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd22, 0x16, 0x0a06) : CmpInfo('PMU',             'M55',      None                ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd22, 0x00, 0x0a07) : CmpInfo('EWIC',            'M55',      None                ),
     (ARM_ID, CORESIGHT_CLASS, 0xd22, 0x43, 0x1a01) : CmpInfo('ITM',             'M55',      ITM.factory         ),
     (ARM_ID, CORESIGHT_CLASS, 0xd22, 0x00, 0x1a02) : CmpInfo('DWT',             'M55',      DWTv2.factory       ),
     (ARM_ID, CORESIGHT_CLASS, 0xd22, 0x00, 0x1a03) : CmpInfo('BPU',             'M55',      FPB.factory         ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd22, 0x14, 0x1a14) : CmpInfo('CTI',             'M55',      None                ),
     (ARM_ID, CORESIGHT_CLASS, 0xd22, 0x00, 0x2a04) : CmpInfo('SCS',             'M55',      CortexM_v8M.factory ),
     (ARM_ID, CORESIGHT_CLASS, 0xd22, 0x11, 0)      : CmpInfo('TPIU',            'M55',      TPIU.factory        ),
     (ARM_ID, CORESIGHT_CLASS, 0xd22, 0x13, 0x4a13) : CmpInfo('ETM',             'M55',      None                ),
-    (ARM_ID, CORESIGHT_CLASS, 0xd22, 0x16, 0x0a06) : CmpInfo('PMU',             'M55',      None                ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd23, 0x16, 0x0a06) : CmpInfo('PMU',             'M85',      None                ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd23, 0x00, 0x0a07) : CmpInfo('EWIC',            'M85',      None                ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd23, 0x43, 0x1a01) : CmpInfo('ITM',             'M85',      ITM.factory         ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd23, 0x00, 0x1a02) : CmpInfo('DWT',             'M85',      DWTv2.factory       ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd23, 0x00, 0x1a03) : CmpInfo('BPU',             'M85',      FPB.factory         ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd23, 0x14, 0x1a14) : CmpInfo('CTI',             'M85',      None                ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd23, 0x00, 0x2a04) : CmpInfo('SCS',             'M85',      CortexM_v8M.factory ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd23, 0x11, 0)      : CmpInfo('TPIU',            'M85',      TPIU.factory        ),
+    (ARM_ID, CORESIGHT_CLASS, 0xd23, 0x13, 0x4a13) : CmpInfo('ETM',             'M85',      None                ),
     (ARM_ID, CORESIGHT_CLASS, 0xd31, 0x31, 0x0a31) : CmpInfo('MTB',             'M35P',     None                ),
     (ARM_ID, CORESIGHT_CLASS, 0xd31, 0x43, 0x1a01) : CmpInfo('ITM',             'M35P',     ITM.factory         ),
     (ARM_ID, CORESIGHT_CLASS, 0xd31, 0x00, 0x1a02) : CmpInfo('DWT',             'M35P',     DWTv2.factory       ),
@@ -214,6 +240,17 @@ COMPONENT_MAP = {
     (ARM_ID, GENERIC_CLASS,   0x00d, 0x00, 0)      : CmpInfo('SCS',             'SC000',    CortexM.factory     ),
     (ARM_ID, GENERIC_CLASS,   0x00e, 0x00, 0)      : CmpInfo('FPB',             'v7-M',     FPB.factory         ),
     (ARM_ID, SYSTEM_CLASS,    0x101, 0x00, 0)      : CmpInfo('TSGEN',           None,       None                ), # Timestamp Generator
+    (ARM_ID, SYSTEM_CLASS,    0x580, 0x00, 0)      : CmpInfo('U55',             None,       None                ), # Ethos U55 NPU
     (FSL_ID, CORESIGHT_CLASS, 0x000, 0x04, 0)      : CmpInfo('MTBDWT',          None,       None                ),
+    (STM_ID, SYSTEM_CLASS,    0x000, 0x00, 0)      : CmpInfo('DBGMCU',          None,       None                ),
+  # Designer      |Component Class |Part  |Type |Archid           |Name        |Product    |Factory
+    (ARM_CHINA_ID, CORESIGHT_CLASS, 0x132, 0x31, 0x0a31) : CmpInfo('MTB',       'Star-MC1', None                ),
+    (ARM_CHINA_ID, CORESIGHT_CLASS, 0x132, 0x43, 0x1a01) : CmpInfo('ITM',       'Star-MC1', ITM.factory         ),
+    (ARM_CHINA_ID, CORESIGHT_CLASS, 0x132, 0x00, 0x1a02) : CmpInfo('DWT',       'Star-MC1', DWTv2.factory       ),
+    (ARM_CHINA_ID, CORESIGHT_CLASS, 0x132, 0x00, 0x1a03) : CmpInfo('BPU',       'Star-MC1', FPB.factory         ),
+    (ARM_CHINA_ID, CORESIGHT_CLASS, 0x132, 0x14, 0x1a14) : CmpInfo('CTI',       'Star-MC1', None                ),
+    (ARM_CHINA_ID, CORESIGHT_CLASS, 0x132, 0x00, 0x2a04) : CmpInfo('SCS',       'Star-MC1', CortexM_v8M.factory ),
+    (ARM_CHINA_ID, CORESIGHT_CLASS, 0x132, 0x13, 0x4a13) : CmpInfo('ETM',       'Star-MC1', None                ),
+    (ARM_CHINA_ID, CORESIGHT_CLASS, 0x132, 0x11, 0)      : CmpInfo('TPIU',      'Star-MC1', TPIU.factory        ),
     }
 

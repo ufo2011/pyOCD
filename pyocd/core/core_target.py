@@ -26,6 +26,11 @@ class CoreTarget(TargetGraphNode):
     """@brief Target base class for CPU cores."""
 
     @property
+    def name(self) -> str:
+        """@brief CPU type name."""
+        raise NotImplementedError()
+
+    @property
     def core_number(self) -> int:
         raise NotImplementedError()
 
@@ -44,4 +49,7 @@ class CoreTarget(TargetGraphNode):
         raise NotImplementedError()
 
     def set_target_context(self, context: "DebugContext") -> None:
+        raise NotImplementedError()
+
+    def exception_number_to_name(self, exc_num: int) -> Optional[str]:
         raise NotImplementedError()

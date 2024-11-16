@@ -1,6 +1,6 @@
 # pyOCD debugger
 # Copyright (c) 2018-2020 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2021-2023 Chris Reed
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,26 +15,73 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from time import sleep
 import logging
 from typing import (Callable, Collection, Dict, List, Optional, overload, Sequence, Set, TYPE_CHECKING, Tuple, Union)
-from typing_extensions import Literal
-
-from pyocd.probe.pydapaccess.dap_access_api import DAPAccessIntf
+from typing_extensions import (Literal, Protocol)
 
 from .debug_probe import DebugProbe
 from ..core import exceptions
 from ..core.plugin import Plugin
+from ..core.options import OptionInfo
 from .pydapaccess import DAPAccess
 from ..board.mbed_board import MbedBoard
-from ..board.board_ids import BOARD_ID_TO_INFO
+from ..board.board_ids import (BoardInfo, BOARD_ID_TO_INFO)
 
 if TYPE_CHECKING:
+    from types import TracebackType
     from ..board.board import Board
 
 LOG = logging.getLogger(__name__)
 TRACE = LOG.getChild("trace")
 TRACE.setLevel(logging.CRITICAL)
+
+class _OpenableProtocol(Protocol):
+    @property
+    def is_open(self) -> bool:
+        ...
+
+    def open(self) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+class _TemporaryOpen:
+    """@brief Context manager to ensure the device is open for a short time."""
+
+    def __init__(self, device: _OpenableProtocol, suppress_exceptions: bool = True) -> None:
+        self._device = device
+        self._suppress_exceptions = suppress_exceptions
+        self._did_open_link: bool = False
+
+    def __enter__(self) -> _TemporaryOpen:
+        try:
+            # Temporarily open the device if not already opened.
+            if not self._device.is_open:
+                self._device.open()
+                self._did_open_link = True
+        except (DAPAccess.Error, exceptions.Error) as err:
+            if not self._suppress_exceptions:
+                raise
+            else:
+                LOG.debug("suppressing error from attempting to open device %s: %s", self._device, err)
+
+        return self
+
+    def __exit__(self, exc_type: Optional[type], exc_value: Optional[Exception], traceback: Optional[TracebackType]) -> bool:
+        # Close the device if we had to open it.
+        if self._did_open_link:
+            self._device.close()
+
+        # Check for and possibly suppress an exception.
+        if (exc_type is not None) and issubclass(exc_type, exceptions.Error):
+            if self._suppress_exceptions:
+                return True
+
+        return False
 
 class CMSISDAPProbe(DebugProbe):
     """@brief Wraps a pydapaccess link as a DebugProbe.
@@ -85,14 +132,18 @@ class CMSISDAPProbe(DebugProbe):
     DAPLINK_VIDPID = (0x0d28, 0x0204)
 
     @classmethod
-    def get_all_connected_probes(cls, unique_id: str = None, is_explicit: bool = False) -> Sequence["DebugProbe"]:
+    def get_all_connected_probes(
+                cls,
+                unique_id: Optional[str] = None,
+                is_explicit: bool = False
+            ) -> Sequence[DebugProbe]:
         try:
             return [cls(dev) for dev in DAPAccess.get_connected_devices()]
         except DAPAccess.Error as exc:
             raise cls._convert_exception(exc) from exc
 
     @classmethod
-    def get_probe_with_id(cls, unique_id: str, is_explicit: bool = False) -> Optional["DebugProbe"]:
+    def get_probe_with_id(cls, unique_id: str, is_explicit: bool = False) -> Optional[DebugProbe]:
         try:
             dap_access = DAPAccess.get_device(unique_id)
             if dap_access is not None:
@@ -102,8 +153,8 @@ class CMSISDAPProbe(DebugProbe):
         except DAPAccess.Error as exc:
             raise cls._convert_exception(exc) from exc
 
-    def __init__(self, device: DAPAccessIntf) -> None:
-        super(CMSISDAPProbe, self).__init__()
+    def __init__(self, device: DAPAccess) -> None:
+        super().__init__()
         self._link = device
         self._supported_protocols: List[DebugProbe.Protocol] = []
         self._protocol: Optional[DebugProbe.Protocol] = None
@@ -127,13 +178,7 @@ class CMSISDAPProbe(DebugProbe):
 
     @property
     def description(self) -> str:
-        try:
-            # self.board_id may be None.
-            board_info = BOARD_ID_TO_INFO[self.board_id]
-        except KeyError:
-            return self.vendor_name + " " + self.product_name
-        else:
-            return "{0} [{1}]".format(board_info.name, board_info.target)
+        return self.vendor_name + " " + self.product_name
 
     @property
     def vendor_name(self) -> str:
@@ -164,18 +209,67 @@ class CMSISDAPProbe(DebugProbe):
     def capabilities(self) -> Set[DebugProbe.Capability]:
         return self._caps
 
-    def create_associated_board(self) -> Optional["Board"]:
+    @property
+    def associated_board_info(self) -> Optional[BoardInfo]:
+        """@brief Info about the board associated with this probe, if known."""
+        # Get internal board info if available.
+        if (self.board_id is not None) and (self.board_id in BOARD_ID_TO_INFO):
+            info = BOARD_ID_TO_INFO[self.board_id]
+        else:
+            info = None
+
+        with _TemporaryOpen(self._link):
+            if self._link.supports_board_and_target_names:
+                # Get v2.1 board and target info values.
+                vendor, board = self._link.board_names
+                _, part_number = self._link.target_names
+
+                # Use the target from internal board info in preference, so built-in targets take
+                # precedence over DFPs (because the probe will only report part numbers from DFPs).
+                if info and info.target:
+                    target_device_name = info.target
+                elif part_number:
+                    target_device_name = part_number.lower().replace("-", "_")
+                else:
+                    target_device_name = None
+
+                # If we have either target type or board then construct the board info.
+                if target_device_name or board:
+                    # Vendor can be None, but the BoardInfo must have a valid name.
+                    if not board:
+                        assert target_device_name
+                        board = "Generic " + (part_number or target_device_name)
+
+                    # If we also have the ID based info, then use the test binary from that.
+                    binary_name = info.binary if (info is not None) else None
+
+                    # Create a new board info object with the data from the probe.
+                    info = BoardInfo(name=board, target=target_device_name, vendor=vendor, binary=binary_name)
+
+        return info
+
+    def create_associated_board(self) -> Optional[Board]:
         assert self.session is not None
 
-        # Only support associated Mbed boards for DAPLink firmware. We can't assume other
-        # CMSIS-DAP firmware is using the same serial number format, so we cannot reliably
-        # extract the board ID.
-        if self.board_id is not None:
-            return MbedBoard(self.session, board_id=self.board_id)
+        board_info = self.associated_board_info
+        if self.board_id or board_info:
+            return MbedBoard(self.session, board_info=board_info, board_id=self.board_id)
+        return None
+
+    def get_accessible_pins(self, group: DebugProbe.PinGroup) -> Tuple[int, int]:
+        """@brief Return masks of pins accessible via the .read_pins()/.write_pins() methods.
+
+        @return Tuple of pin masks for (0) readable, (1) writable pins. See DebugProbe.Pin for mask
+        values for those pins that have constants.
+        """
+        if group is DebugProbe.PinGroup.PROTOCOL_PINS:
+            return (self.ProtocolPin.ALL_PINS, self.ProtocolPin.ALL_PINS)
         else:
-            return None
+            return (0, 0)
 
     def open(self) -> None:
+        if self._is_open:
+            return
         assert self.session
         try:
             TRACE.debug("trace: open")
@@ -184,19 +278,35 @@ class CMSISDAPProbe(DebugProbe):
             self._is_open = True
             self._link.set_deferred_transfer(self.session.options.get('cmsis_dap.deferred_transfers'))
 
+            if self._link.supports_board_and_target_names:
+                board_names = self._link.board_names
+                target_names = self._link.target_names
+                if board_names != (None, None):
+                    LOG.debug("Board: %s %s", board_names[0] or "(no vendor)", board_names[1] or "(no name)")
+                if target_names != (None, None):
+                    LOG.debug("Target: %s %s", target_names[0] or "(no vendor)", target_names[1] or "(no name)")
+
             # Read CMSIS-DAP capabilities
-            self._capabilities = self._link.identify(DAPAccess.ID.CAPABILITIES)
+            caps_value = self._link.identify(DAPAccess.ID.CAPABILITIES)
+            if not isinstance(caps_value, int):
+                raise exceptions.ProbeError(f"probe {self.unique_id} returned invalid capabilities")
+            self._capabilities = caps_value
             self._supported_protocols = [DebugProbe.Protocol.DEFAULT]
             if self._capabilities & self.SWD_CAPABILITY_MASK:
                 self._supported_protocols.append(DebugProbe.Protocol.SWD)
             if self._capabilities & self.JTAG_CAPABILITY_MASK:
                 self._supported_protocols.append(DebugProbe.Protocol.JTAG)
+            # Warn if neither SWD nor JTAG is supported.
+            if (self._capabilities & (self.SWD_CAPABILITY_MASK | self.JTAG_CAPABILITY_MASK)) == 0:
+                LOG.warning("probe %s reported capabilities indicating it supports neither SWD nor JTAG",
+                        self.unique_id)
 
             self._caps = {
                 self.Capability.SWJ_SEQUENCE,
                 self.Capability.BANKED_DP_REGISTERS,
                 self.Capability.APv2_ADDRESSES,
                 self.Capability.JTAG_SEQUENCE,
+                self.Capability.PIN_ACCESS,
                 }
             if self._link.has_swd_sequence:
                 self._caps.add(self.Capability.SWD_SEQUENCE)
@@ -206,6 +316,8 @@ class CMSISDAPProbe(DebugProbe):
             raise self._convert_exception(exc) from exc
 
     def close(self) -> None:
+        if not self._is_open:
+            return
         try:
             TRACE.debug("trace: close")
 
@@ -235,8 +347,9 @@ class CMSISDAPProbe(DebugProbe):
             raise self._convert_exception(exc) from exc
 
         # Read the current mode and save it.
-        actualMode = self._link.get_swj_mode()
-        self._protocol = self._PORT_TO_PROTOCOL[actualMode]
+        actual_mode = self._link.get_swj_mode()
+        assert actual_mode is not None
+        self._protocol = self._PORT_TO_PROTOCOL[actual_mode]
 
     def swj_sequence(self, length: int, bits: int) -> None:
         TRACE.debug("trace: swj_sequence(length=%i, bits=%x)", length, bits)
@@ -315,6 +428,87 @@ class CMSISDAPProbe(DebugProbe):
         except DAPAccess.Error as exc:
             TRACE.debug("trace: error from flush: %r", exc)
             raise self._convert_exception(exc) from exc
+
+    def read_pins(self, group: DebugProbe.PinGroup, mask: int) -> int:
+        """@brief Read values of selected debug probe pins.
+
+        See DebugProbe.ProtocolPin for mask values.
+
+        @param self
+        @param group Select the pin group to read.
+        @param mask Bit mask indicating which pins will be read. The return value will contain only
+            bits set in this mask.
+        @return Bit mask with the current value of selected pins at each pin's relevant bit position.
+        """
+        try:
+            if group is DebugProbe.PinGroup.PROTOCOL_PINS:
+                # CMSIS-DAP DAP_SWJ_Pins command will always return all pin values, so mask
+                # the ones the caller wants.
+                result = self.from_cmsis_dap_pins(self._link.pin_access(0, 0)) & mask
+                TRACE.debug("trace: read_pins(%x) -> %s", mask, result)
+                return result
+            else:
+                return 0
+        except DAPAccess.Error as exc:
+            raise self._convert_exception(exc) from exc
+
+    def write_pins(self, group: DebugProbe.PinGroup, mask: int, value: int) -> None:
+        """@brief Set values of selected debug probe pins.
+
+        See DebugProbe.ProtocolPin for mask values.
+
+        @param self
+        @param group Select the pin group to read.
+        @param mask Bit mask indicating which pins will be written.
+        @param value Mask containing the bit value of to written for selected pins at each pin's
+            relevant bit position..
+        """
+        try:
+            if group is DebugProbe.PinGroup.PROTOCOL_PINS:
+                self._link.pin_access(self.to_cmsis_dap_pins(mask), self.to_cmsis_dap_pins(value))
+                TRACE.debug("trace: write_pins(%s, %s)", mask, value)
+        except DAPAccess.Error as exc:
+            raise self._convert_exception(exc) from exc
+
+    @staticmethod
+    def to_cmsis_dap_pins(mask: int) -> int:
+        # - [0] SWCLK/TCK
+        # - [1] SWDIO/TMS
+        # - [2] TDI
+        # - [3] TDO
+        # - [5] nTRST
+        # - [7] nRESET
+        result = 0
+        if mask & DebugProbe.ProtocolPin.SWCLK_TCK:
+            result |= 1 << 0
+        if mask & DebugProbe.ProtocolPin.SWDIO_TMS:
+            result |= 1 << 1
+        if mask & DebugProbe.ProtocolPin.TDI:
+            result |= 1 << 2
+        if mask & DebugProbe.ProtocolPin.TDO:
+            result |= 1 << 3
+        if mask & DebugProbe.ProtocolPin.nRESET:
+            result |= 1 << 7
+        if mask & DebugProbe.ProtocolPin.nTRST:
+            result |= 1 << 5
+        return result
+
+    @staticmethod
+    def from_cmsis_dap_pins(mask: int) -> int:
+        result = 0
+        if mask & (1 << 0):
+            result |= DebugProbe.ProtocolPin.SWCLK_TCK
+        if mask & (1 << 1):
+            result |= DebugProbe.ProtocolPin.SWDIO_TMS
+        if mask & (1 << 2):
+            result |= DebugProbe.ProtocolPin.TDI
+        if mask & (1 << 3):
+            result |= DebugProbe.ProtocolPin.TDO
+        if mask & (1 << 5):
+            result |= DebugProbe.ProtocolPin.nTRST
+        if mask & (1 << 7):
+            result |= DebugProbe.ProtocolPin.nRESET
+        return result
 
     # ------------------------------------------- #
     #          DAP Access functions
@@ -471,7 +665,7 @@ class CMSISDAPProbe(DebugProbe):
 
         if now:
             TRACE.debug("trace: read_ap_multi(addr=%#010x, count=%i) -> [%s]", addr, count,
-                    ", ".join(["%#010x" % v for v in result]))
+                    ", ".join(["%#010x" % v for v in result])) # type: ignore # result is always iterable if now is True
             return result
         else:
             return read_ap_repeat_callback
@@ -483,7 +677,7 @@ class CMSISDAPProbe(DebugProbe):
         try:
             self._link.reg_write_repeat(len(values), ap_reg, values, dap_index=0)
             TRACE.debug("trace: write_ap_multi(addr=%#010x, (%i)[%s])", addr, len(values),
-                    ", ".join(["%#010x" % v for v in values]))
+                   ", ".join(["%#010x" % v for v in values]))
         except DAPAccess.Error as exc:
             TRACE.debug("trace: write_ap_multi(addr=%#010x, (%i)[%s]) -> error(%s)", addr, len(values),
                     ", ".join(["%#010x" % v for v in values]), exc)
@@ -546,3 +740,13 @@ class CMSISDAPProbePlugin(Plugin):
     @property
     def description(self):
         return "CMSIS-DAP debug probe"
+
+    @property
+    def options(self):
+        """@brief Returns CMSIS-DAP probe options."""
+        return [
+            OptionInfo('cmsis_dap.deferred_transfers', bool, True,
+                "Whether the CMSIS-DAP probe backend will use deferred transfers for improved performance."),
+            OptionInfo('cmsis_dap.limit_packets', bool, False,
+                "Restrict CMSIS-DAP backend to using a single in-flight command at a time."),
+            ]

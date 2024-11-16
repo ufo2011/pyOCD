@@ -1,6 +1,6 @@
 # pyOCD debugger
 # Copyright (c) 2018-2020 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2021-2023 Chris Reed
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,26 +15,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import logging
+import errno
 import itertools
+import logging
+import os
+from typing import (IO, TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple, Union)
+
 from elftools.elf.elffile import ELFFile
 from intelhex import IntelHex
-import errno
-from typing import (Any, Callable, Dict, IO, List, Optional, Tuple, TYPE_CHECKING, Union)
 
-from .loader import (
-    FlashLoader,
-    ProgressCallback,
-)
 from ..core import exceptions
+from .loader import (FlashLoader, ProgressCallback)
 
 if TYPE_CHECKING:
     from ..core.session import Session
 
 LOG = logging.getLogger(__name__)
 
-def ranges(i: List[int]) -> List[Tuple[int, int]]:
+def ranges(i: List[int]) -> Iterator[Tuple[int, int]]:
     """Accepts a sorted list of byte addresses. Breaks the addresses into contiguous ranges.
     Yields 2-tuples of the start and end address for each contiguous range.
 
@@ -64,7 +62,8 @@ class FileProgrammer(object):
             chip_erase: Optional[bool] = None,
             smart_flash: Optional[bool] = None,
             trust_crc: Optional[bool] = None,
-            keep_unwritten: Optional[bool] = None
+            keep_unwritten: Optional[bool] = None,
+            no_reset: Optional[bool] = None
         ):
         """@brief Constructor.
 
@@ -85,12 +84,15 @@ class FileProgrammer(object):
             written, there may be ranges of flash that would be erased but not written with new
             data. This parameter sets whether the existing contents of those unwritten ranges will
             be read from memory and restored while programming.
+        @param no_reset Boolean indicating whether if the device should not be reset after the
+            programming process has finished.
         """
         self._session = session
         self._chip_erase = chip_erase
         self._smart_flash = smart_flash
         self._trust_crc = trust_crc
         self._keep_unwritten = keep_unwritten
+        self._no_reset = no_reset
         self._progress = progress
         self._loader = None
 
@@ -149,7 +151,8 @@ class FileProgrammer(object):
                                     chip_erase=self._chip_erase,
                                     smart_flash=self._smart_flash,
                                     trust_crc=self._trust_crc,
-                                    keep_unwritten=self._keep_unwritten)
+                                    keep_unwritten=self._keep_unwritten,
+                                    no_reset=self._no_reset)
 
         # file_obj = None
         # Open the file if a path was provided.
@@ -179,6 +182,7 @@ class FileProgrammer(object):
         # If no base address is specified use the start of the boot memory.
         address = kwargs.get('base_address', None)
         if address is None:
+            assert self._session.target
             boot_memory = self._session.target.memory_map.get_boot_memory()
             if boot_memory is None:
                 raise exceptions.TargetSupportError("No boot memory is defined for this device")

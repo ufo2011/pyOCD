@@ -20,11 +20,18 @@ these types of debug probes:
  Plug-in Name        | Debug Probe Type
 ---------------------|--------------------
 `cmsisdap`           | [CMSIS-DAP](http://www.keil.com/pack/doc/CMSIS/DAP/html/index.html)
-`pemicro`            | [PE Micro](https://pemicro.com/) Cyclone and Multilink
 `picoprobe`          | Raspberry Pi [Picoprobe](https://github.com/raspberrypi/picoprobe)
 `jlink`              | [SEGGER](https://segger.com/) [J-Link](https://www.segger.com/products/debug-trace-probes/)
 `stlink`             | [STMicro](https://st.com/) [STLinkV2](https://www.st.com/en/development-tools/st-link-v2.html) and [STLinkV3](https://www.st.com/en/development-tools/stlink-v3set.html)
 `remote`             | pyOCD [remote debug probe client]({% link _docs/remote_probe_access.md %})
+
+Additional debug probe plugins are available as Python packages through [PyPI](https://pypi.python.org), and
+can be installed with pip:
+
+ Plug-in Name   | Package           | Debug Probe Type
+----------------|-------------------|--------------------
+`pemicro`       | pyocd-pemicro     | [PE Micro](https://pemicro.com/) Cyclone and Multilink.
+
 
 
 ## Unique IDs
@@ -46,6 +53,7 @@ Certain types of on-board debug probes can report the type of the target to whic
 
 Debug probes that support automatic target type reporting:
 
+- CMSIS-DAP probes supporting v2.1 of the protocol and reporting target type info
 - CMSIS-DAP probes based on the DAPLink firmware
 - STLinkV2-1 and STLinkV3
 
@@ -54,28 +62,47 @@ Debug probes that support automatic target type reporting:
 
 To view the connected probes and their unique IDs, run `pyocd list`. This command will produce output looking like this:
 
-      #   Probe                             Unique ID
-    ------------------------------------------------------------------------------------------
-      0   Arm LPC55xx DAPLink CMSIS-DAP     000000803f7099a85fdf51158d5dfcaa6102ef474c504355
-      1   Arm Musca-B1 [musca_b1]           500700001c16fcd400000000000000000000000097969902
+      #   Probe/Board                       Unique ID                                          Target
+    --------------------------------------------------------------------------------------------------------------------
+      0   Arm DAPLink CMSIS-DAP             02400b0129164e4500440012706e0007f301000097969900   ✔︎ k64f
+          NXP                               FRDM-K64F
 
-For those debug probes that support automatic target type reporting, the default target type is visible in brackets
-next to the probe's name. In addition, the name of the board is printed instead of the type of debug probe. This can be
-seen in the example output above for the "Arm Musca-B1" board, which has a default target type of `musca_b1`.
+      1   STLINK-V3                         002500074741500420383733                           ✖︎ stm32u585aiix
+          B-U585I-IOT02A
 
-If no target type appears in brackets, as can be seen above for the "Arm LPC55xx DAPLink CMSIS-DAP" probe (because it
-is a standalone probe), it means the debug probe does not report the type of its connected target. In this
-case, the target type must be manually specified either on the command line with the `-t` / `--target`
-argument, or by setting the `target_override` session option (possibly in a config file).
+      2   STM32 STLink                      066EFF555051897267233656                           ✔︎ stm32l475xg
+          DISCO-L475VG-IOT01A
 
-Note that the printed list includes only those probes that pyOCD can actively query for, which currently means only USB
-based probes.
+      3   Segger J-Link OB-K22-NordicSemi   960177309                                          n/a
+
+
+The output is divided into columns for the probe number, probe name, unique ID, and default target type name.
+Probes that have additional board identification will have a second row with the board name and possibly board
+vendor.
+
+The "Target" column shows the debug probe's default target type for debug probes that support automatic target
+type reporting. Whether that target type is installed and available for use is shown by a check or "X" mark
+before the target type name (and in different colours, if colour output is enabled). If an "X" mark is
+displayed, see the [target support documentation]({% link _docs/target_support.md %}) for information about
+how you can install that the target type.
+
+For debug probes that do not support automatic target type reporting, the Target column will simply display
+"n/a". This can be seen above for the "Segger J-Link OB-K22-NordicSemi" probe. The target type must be
+specified manually in such cases, otherwise full functionality, such as flash programming, will not be
+available.
+
+In any case, whether required because the probe doesn't have a default, or to override the default, the target
+type can be specified either on the command line with the `-t` / `--target` argument, or by setting the
+`target_override` session option (e.g., in a [config file]({% link _docs/configuration.md %}#config_file)).
+
+Note that the printed list includes only those probes that pyOCD can actively query for, which currently means
+only USB based probes.
 
 
 ## Selecting the debug probe
 
-All of the pyOCD subcommands that communicate with a target require the user to either implicitly or explicitly
-specify a debug probe.
+All of the pyOCD subcommands that communicate with a target require the user to either implicitly or
+explicitly specify a debug probe.
 
 There are three ways the debug probe is selected:
 
@@ -103,7 +130,7 @@ This section contains notes on the use of different types of debug probes and th
 
 ### CMSIS-DAP
 
-CMSIS-DAP is a debug probe protocol designed by Arm and released as open source as part of the CMSIS project.
+[CMSIS-DAP](https://arm-software.github.io/CMSIS_5/DAP/html/index.html) is a debug probe protocol designed by Arm and released as open source as part of the CMSIS project.
 There are two major versions of CMSIS-DAP, which use different USB classes:
 
 - v1: USB HID. This version is slower than v2. Still the most commonly seen version, although it is now deprecated by
@@ -111,6 +138,8 @@ There are two major versions of CMSIS-DAP, which use different USB classes:
 - v2: USB vendor-specific using bulk pipes, permitting higher performance than v1. WinUSB-enabled to allow driverless
     usage on Windows 8 and above. (Can be used with Windows 7 if device installation settings are set to automatically
     download and install drivers for new devices from the Internet.)
+
+If a debug probe provides both v1 and v2 interfaces, pyOCD will normally use the v2 interface. (See the `cmsis_dap.prefer_v1` option described below if this needs to be changed.)
 
 These are some of the commercial probes by silicon vendors using the CMSIS-DAP protocol, both standalone and on-board:
 
@@ -126,10 +155,11 @@ These are some of the commercial probes by silicon vendors using the CMSIS-DAP p
 
 In addition, there are numerous other commercial and open source debug probes utilising the CMSIS-DAP protocol.
 
-PyOCD supports automatic target type identification for debug probes built with the widely used
-[DAPLink](https://github.com/ARMmbed/DAPLink) firmware.
+PyOCD supports automatic target type identification for any debug probe supporting CMSIS-DAP v2.1 or later that reports the target type from the DAP_Info command. Automatic target type identification is also supported for the widely used
+[DAPLink](https://github.com/ARMmbed/DAPLink) firmware using the [board ID]({% link _docs/developer/board_ids.md %}) system.
 
-[DAPLink firmware updates](https://daplink.io/)
+DAPLink firmware updates are available on the [daplink.io](https://daplink.io/) site and on the project's
+[releases page](https://github.com/ARMmbed/DAPLink/releases) on GitHub.
 
 #### Session options
 
@@ -137,11 +167,33 @@ PyOCD supports automatic target type identification for debug probes built with 
     By disabling deferred transfers, all writes take effect immediately. However, performance is negatively affected.
 - `cmsis_dap.limit_packets` (bool, default False) Restrict CMSIS-DAP backend to using a single in-flight command at a
     time. This is useful on some systems where USB is problematic, in particular virtual machines.
+- `cmsis_dap.prefer_v1` (bool, default False) Determines whether pyOCD will choose a CMSIS-DAP v1 interface of v2 in cases where a device provides both for backwards compatibility. There is rarely a reason to change this option, except for testing or issues. **Note:** This option can only be set in a default config file (e.g., `pyocd.yaml` in the working directory) because of how options loading is ordered in relation to debug probe enumeration.
 
 #### Microchip EDBG
 
 The Microchip (previously Atmel) EDBG probe firmware, at the time of this writing, provides a CMSIS-DAP v1 interface.
 On macOS, reading command responses always times out. The probe works on other OSes, however.
+
+### TI XDS110
+
+XDS110 firmware version 03.00.00.25 is known to have an issue when using multiple outstanding packets (the default setting). To work around this, set the `cmsis_dap.limit_packets` session option, e.g. `-Ocmsis_dap.limit_packets=1` on the command line. Earlier firmware versions most likely exhibit the issue; it is unknown whether it is fixed in more recent versions.
+
+
+### PE Micro Cyclone and Multilink
+
+The Cyclone and Multilink debug probes from PE Micro are supported through the use of a separate probe driver
+plugin called `pyocd-pemicro`. This plugin can be installed at any time using `pip`:
+
+    pip install pyocd-pemicro
+
+It can also be installed at the same time as pyOCD by adding the `pemicro` install extra:
+
+    pip install pyocd[pemicro]
+
+Once the PE Micro probe driver is installed, Cyclone and Multilink probes connected by USB will immediately
+be available for use.
+
+Currently, PE Micro probes connected via the network are not accessible.
 
 
 ### STLink
@@ -156,14 +208,17 @@ No host resident drivers need to be installed to use STLink probes; only libusb 
 The minimum supported STLink firmware version is V2J24, or any V3 version. However, upgrading to the latest version
 is strongly recommended. Numerous bugs have been fixed, and new commands added for feature and performance improvements.
 
-- V2J26: Adds 16-bit transfer support. If not supported, pyOCD will fall back to 8-bit transfers—it is possible this
+- V2J26: Adds 16-bit transfer support. If not supported, pyOCD will fall back to 8-bit transfers. It is possible this
     will produce unexpected behaviour if used to access Device memory (e.g. memory mapped registers).
 - V2J28: Minimum version for multicore target support.
-- V2J32/V3J6: Allows access to banked DP registers. Usually not needed.
+- V2J32/V3J2: Allows access to banked DP registers. Usually not needed.
+- V2J32/V3J2: Supports setting the AHB and AXI transfer attributes. See
+    [`set hnonsec`]({% link _docs/command_reference.md %}#hnonsec) and
+    [`set hprot`]({% link _docs/command_reference.md %}#hprot).
 
-[Firmware updates](https://www.st.com/en/development-tools/stsw-link007.html)
+[STLink firmware updates on www.st.com](https://www.st.com/en/development-tools/stsw-link007.html).
 
-PyOCD supports automatic target type identification for on-board STLink probes that report a board ID.
+PyOCD supports automatic target type identification for on-board STLink probes that report a [board ID]({% link _docs/developer/board_ids.md %}).
 
 #### STLinkV3 SWD/JTAG frequencies
 
@@ -195,7 +250,7 @@ These are the SWD/JTAG frequencies available with different values of `stlink.v3
 To use a Segger J-Link probe, the driver package must be installed. Segger makes drivers available for Linux, macOS,
 and Windows.
 
-[Firmware and driver installer and updates](https://www.segger.com/downloads/jlink/)
+[J-Link firmware and driver installer and updates on www.segger.com](https://www.segger.com/downloads/jlink/)
 
 On macOS, you can install the `segger-jlink` cask with Homebrew to get managed driver updates.
 

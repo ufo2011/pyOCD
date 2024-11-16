@@ -1,6 +1,6 @@
 # pyOCD debugger
 # Copyright (c) 2015-2020 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2021-2023 Chris Reed
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +14,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
@@ -195,15 +197,19 @@ class APAddressBase:
     version-specific subclasses. This is the value used by the DP hardware and passed to the
     DebugPort's read_ap() and write_ap() methods.
 
+    AP addresses include the index of the DP to which the AP is connected. On most systems there is only
+    one DP with index 0.
+
     The class also indicates which version of AP is targeted: either APv1 or APv2. The _ap_version_
     property reports this version number, though it is also encoded by the subclass. The AP version
     is coupled with the address because the two are intrinsically connected; the version defines the
     address format.
     """
 
-    def __init__(self, address: int) -> None:
+    def __init__(self, address: int, dp: int = 0) -> None:
         """@brief Constructor accepting the nominal address."""
         self._nominal_address = address
+        self._dp = dp
 
     @property
     def ap_version(self) -> APVersion:
@@ -230,22 +236,42 @@ class APAddressBase:
         """@brief Address of the IDR register."""
         raise NotImplementedError()
 
+    @property
+    def dp_index(self) -> int:
+        """@brief Index of the DP to which this AP is attached."""
+        return self._dp
+
     def __hash__(self) -> int:
-        return hash(self.nominal_address)
+        return hash(self.nominal_address | (self._dp << 64))
 
     def __eq__(self, other: Any) -> bool:
-        return (self.nominal_address == other.nominal_address) \
-                if isinstance(other, APAddressBase) else (self.nominal_address == other)
+        """Equality tests against other APAddressBase or subclass instances also compare the DP index.
+        Supports comparing against raw (int) nominal addresses, in which case the DP index is ignored.
+        """
+        if isinstance(other, APAddressBase):
+            return (self.nominal_address == other.nominal_address) and (self.dp_index == other.dp_index)
+        elif isinstance(other, int):
+            return (self.nominal_address == other)
+        else:
+            return False
 
     def __lt__(self, other: Any) -> bool:
-        return (self.nominal_address < other.nominal_address) \
-                if isinstance(other, APAddressBase) else (self.nominal_address < other)
+        """Ordering tests against other APAddressBase or subclass instances include the DP index, such that
+        instances with equal nominal addresses but different DP indices will be ordered by DP index.
+        Supports comparing against raw (int) nominal addresses, in which case the DP index is ignored.
+        """
+        if isinstance(other, APAddressBase):
+            return (self.nominal_address < other.nominal_address) and (self.dp_index < other.dp_index)
+        elif isinstance(other, int):
+            return (self.nominal_address < other)
+        else:
+            return False
 
     def __str__(self) -> str:
         raise NotImplementedError()
 
     def __repr__(self) -> str:
-        return "<{}@{:#x} {}>".format(self.__class__.__name__, id(self), str(self))
+        return "<{}@{:#x} {} dp={}>".format(self.__class__.__name__, id(self), str(self), self.dp_index)
 
 class APv1Address(APAddressBase):
     """@brief Represents the address for an APv1.
@@ -306,7 +332,7 @@ class AccessPort:
     """@brief Base class for a CoreSight Access Port (AP) instance."""
 
     @staticmethod
-    def probe(dp: "DebugPort", ap_num: int) -> bool:
+    def probe(dp: DebugPort, ap_num: int) -> bool:
         """@brief Determine if an AP exists with the given AP number.
 
         Only applicable for ADIv5.
@@ -320,9 +346,9 @@ class AccessPort:
 
     @staticmethod
     def create(
-            dp: "DebugPort",
+            dp: DebugPort,
             ap_address: APAddressBase,
-            cmpid: Optional["CoreSightComponentID"] = None
+            cmpid: Optional[CoreSightComponentID] = None
         ) -> "AccessPort":
         """@brief Create a new AP object.
 
@@ -369,12 +395,12 @@ class AccessPort:
 
     def __init__(
                 self,
-                dp: "DebugPort",
+                dp: DebugPort,
                 ap_address: APAddressBase,
                 idr: Optional[int] = None,
                 name: Optional[str] = None,
                 flags: int = 0,
-                cmpid: Optional["CoreSightComponentID"] = None
+                cmpid: Optional[CoreSightComponentID] = None
             ) -> None:
         """@brief AP constructor.
         @param self
@@ -389,16 +415,34 @@ class AccessPort:
         self.address = ap_address
         self._ap_version = ap_address.ap_version
         self.idr = idr
+        self.variant = 0
+        self.revision = 0
+        self.ap_class = 0
+        self.ap_type = 0
         self.type_name = name or "AP"
         self.rom_addr = 0
         self.has_rom_table = False
         self.rom_table = None
-        self.core: Optional["CoreTarget"] = None
+        self.core: Optional[CoreTarget] = None
         self._flags = flags
         self._cmpid = cmpid
 
     @property
+    def description(self) -> str:
+        """ @brief The AP's type and version description.
+
+        If the AP is an unknown proprietary type, then only the string "proprietary" is returned.
+
+        This property should only be read after init() has be called.
+        """
+        if self.type_name is not None:
+            return f"{self.type_name} var{self.variant} rev{self.revision}"
+        else:
+            return "proprietary"
+
+    @property
     def short_description(self) -> str:
+        """ @brief The AP's name and address."""
         return self.type_name + str(self.address)
 
     @property
@@ -421,12 +465,6 @@ class AccessPort:
         # Get the type name for this AP.
         self.ap_class = (self.idr & AP_IDR_CLASS_MASK) >> AP_IDR_CLASS_SHIFT
         self.ap_type = self.idr & AP_IDR_TYPE_MASK
-        if self.type_name is not None:
-            desc = "{} var{} rev{}".format(self.type_name, self.variant, self.revision)
-        else:
-            desc = "proprietary"
-
-        LOG.info("%s IDR = 0x%08x (%s)", self.short_description, self.idr, desc)
 
     def find_components(self) -> None:
         """@brief Find CoreSight components attached to this AP."""
@@ -504,12 +542,12 @@ class MEM_AP(AccessPort, memory_interface.MemoryInterface):
 
     def __init__(
                 self,
-                dp: "DebugPort",
+                dp: DebugPort,
                 ap_address: APAddressBase,
                 idr: Optional[int] = None,
                 name: Optional[str] = None,
                 flags: int = 0,
-                cmpid: Optional["CoreSightComponentID"] = None
+                cmpid: Optional[CoreSightComponentID] = None
             ) -> None:
         super().__init__(dp, ap_address, idr, name, flags, cmpid)
 
@@ -564,13 +602,15 @@ class MEM_AP(AccessPort, memory_interface.MemoryInterface):
         # Ask the probe for an accelerated memory interface for this AP. If it provides one,
         # then bind our memory interface APIs to its methods. Otherwise use our standard
         # memory interface based on AP register accesses.
-        memoryInterface = self.dp.probe.get_memory_interface_for_ap(self.address)
-        if memoryInterface is not None:
-            LOG.debug("Using accelerated memory access interface")
-            self.write_memory = memoryInterface.write_memory
-            self.read_memory = memoryInterface.read_memory
-            self.write_memory_block32 = memoryInterface.write_memory_block32
-            self.read_memory_block32 = memoryInterface.read_memory_block32
+        self._accelerated_memory_interface = self.dp.probe.get_memory_interface_for_ap(self.address)
+        if self._accelerated_memory_interface is not None:
+            LOG.debug("Using accelerated memory access interface for %s", self.short_description)
+            self.write_memory = self._accelerated_write_memory
+            self.read_memory = self._accelerated_read_memory
+            self.write_memory_block32 = self._accelerated_write_memory_block32
+            self.read_memory_block32 = self._accelerated_read_memory_block32
+            self.write_memory_block8 = self._accelerated_write_memory_block8
+            self.read_memory_block8 = self._accelerated_read_memory_block8
         else:
             self.write_memory = self._write_memory
             self.read_memory = self._read_memory
@@ -860,14 +900,14 @@ class MEM_AP(AccessPort, memory_interface.MemoryInterface):
         The AP is locked during the lifetime of the context manager. This means that only the
         calling thread can perform memory transactions.
         """
-        def __init__(self, ap: "MEM_AP", hprot: Optional[int] = None, hnonsec: Optional[int] = None):
+        def __init__(self, ap: MEM_AP, hprot: Optional[int] = None, hnonsec: Optional[int] = None):
             self._ap = ap
             self._hprot = hprot
             self._saved_hprot = None
             self._hnonsec = hnonsec
             self._saved_hnonsec = None
 
-        def __enter__(self) -> "MEM_AP._MemAttrContext":
+        def __enter__(self) -> MEM_AP._MemAttrContext:
             self._ap.lock()
             if self._hprot is not None:
                 self._saved_hprot = self._ap.hprot
@@ -877,7 +917,7 @@ class MEM_AP(AccessPort, memory_interface.MemoryInterface):
                 self._ap.hnonsec = self._hnonsec
             return self
 
-        def __exit__(self, exc_type: type, value: Any, traceback: "TracebackType") -> None:
+        def __exit__(self, exc_type: type, value: Any, traceback: TracebackType) -> None:
             if self._saved_hprot is not None:
                 self._ap.hprot = self._saved_hprot
             if self._saved_hnonsec is not None:
@@ -952,7 +992,7 @@ class MEM_AP(AccessPort, memory_interface.MemoryInterface):
         """@brief Invalidate cached registers associated with this AP."""
         self._cached_csw = -1
 
-    def _reset_did_occur(self, notification: "Notification") -> None:
+    def _reset_did_occur(self, notification: Notification) -> None:
         """@brief Handles reset notifications to invalidate CSW cache."""
         # We clear the cache on all resets just to be safe.
         self._invalidate_cache()
@@ -1057,13 +1097,13 @@ class MEM_AP(AccessPort, memory_interface.MemoryInterface):
         def read_mem_cb() -> int:
             try:
                 if transfer_size <= 32:
-                    res = result_cb()
+                    res = result_cb() # type: ignore # ignore possibly unbound result_cb
                     if transfer_size == 8:
                         res = (res >> ((addr & 0x03) << 3) & 0xff)
                     elif transfer_size == 16:
                         res = (res >> ((addr & 0x02) << 3) & 0xffff)
                 else:
-                    res_mw = result_cb_mw()
+                    res_mw = result_cb_mw() # type: ignore # ignore possibly unbound result_cb_mw
                     res = sum((w << (32 * i)) for i, w in enumerate(res_mw))
                 TRACE.debug("read_mem:%06d %s(ap=0x%x; addr=0x%08x, size=%d) -> 0x%08x }",
                     num, "" if now else "...", self.address.nominal_address, addr, transfer_size, res)
@@ -1173,6 +1213,71 @@ class MEM_AP(AccessPort, memory_interface.MemoryInterface):
             addr += n
         return resp
 
+    # Note: the "type: ignore"s below are ok because the accelerated memory interface accepts
+    # attribute keyword args. The MemoryInterface class should be extended to accept attribute args
+    # too, but that changes a lot of places. So for now just ignore the type error. This will be
+    # addressed anyway when the memory API is refactored.
+    @locked
+    def _accelerated_write_memory(self, addr: int, data: int, transfer_size: int=32) -> None:
+        """@brief Write one memory location using the probe's accelerated memory interface.
+
+        The current CSW value is passed to the accelerted interface, primarily for STLink.
+        """
+        assert self._accelerated_memory_interface is not None
+        self._accelerated_memory_interface.write_memory(addr, data, transfer_size,
+                csw=self._csw) # type: ignore
+
+    @locked
+    def _accelerated_read_memory(self, addr: int, transfer_size: int=32, now: bool=True) \
+            -> Union[int, Callable[[], int]]:
+        """@brief Read one memory location using the probe's accelerated memory interface.
+
+        The current CSW value is passed to the accelerted interface, primarily for STLink.
+        """
+        assert self._accelerated_memory_interface is not None
+        return self._accelerated_memory_interface.read_memory(addr, transfer_size, now,
+                csw=self._csw) # type: ignore
+
+    @locked
+    def _accelerated_write_memory_block32(self, addr: int, data: Sequence[int]) -> None:
+        """@brief Write a memory block using the probe's accelerated memory interface.
+
+        The current CSW value is passed to the accelerted interface, primarily for STLink.
+        """
+        assert self._accelerated_memory_interface is not None
+        self._accelerated_memory_interface.write_memory_block32(addr, data,
+                csw=self._csw) # type: ignore
+
+    @locked
+    def _accelerated_read_memory_block32(self, addr: int, size: int) -> Sequence[int]:
+        """@brief Read a memory block using the probe's accelerated memory interface.
+
+        The current CSW value is passed to the accelerted interface, primarily for STLink.
+        """
+        assert self._accelerated_memory_interface is not None
+        return self._accelerated_memory_interface.read_memory_block32(addr, size,
+                csw=self._csw) # type: ignore
+
+    @locked
+    def _accelerated_write_memory_block8(self, addr: int, data: Sequence[int]) -> None:
+        """@brief Write a memory block using the probe's accelerated memory interface.
+
+        The current CSW value is passed to the accelerted interface, primarily for STLink.
+        """
+        assert self._accelerated_memory_interface is not None
+        self._accelerated_memory_interface.write_memory_block8(addr, data,
+                csw=self._csw) # type: ignore
+
+    @locked
+    def _accelerated_read_memory_block8(self, addr: int, size: int) -> Sequence[int]:
+        """@brief Read a memory block using the probe's accelerated memory interface.
+
+        The current CSW value is passed to the accelerted interface, primarily for STLink.
+        """
+        assert self._accelerated_memory_interface is not None
+        return self._accelerated_memory_interface.read_memory_block8(addr, size,
+                csw=self._csw) # type: ignore
+
     def _handle_error(self, error: Exception, num: int) -> None:
         self.dp._handle_error(error, num)
         self._invalidate_cache()
@@ -1224,6 +1329,12 @@ class AHB_AP(MEM_AP):
 # - [6:0] = 0x3B, Arm's JEP106 identification code
 # - [12:7] = 4, the number of JEP106 continuation codes for Arm
 AP_JEP106_ARM = 0x23b
+
+## @brief Arm China JEP106 code
+#
+# - [6:0] = 0x75, JEP106 identification code
+# - [12:7] = 10, number of JEP106 continuation codes
+AP_JEP106_ARM_CHINA = 0x575
 
 # AP classes
 AP_CLASS_JTAG_AP = 0x0
@@ -1283,4 +1394,6 @@ AP_TYPE_MAP: Dict[Tuple[int, int, int, int], Tuple[str, Type[AccessPort], int]] 
     (AP_JEP106_ARM, AP_CLASS_MEM_AP,    0,  AP_TYPE_AXI5):          ("AXI5-AP", MEM_AP,     AP_ALL_TX_SZ ),
     (AP_JEP106_ARM, AP_CLASS_MEM_AP,    1,  AP_TYPE_AXI5):          ("AXI5-AP", MEM_AP,     AP_ALL_TX_SZ ),
     (AP_JEP106_ARM, AP_CLASS_MEM_AP,    0,  AP_TYPE_AHB5_HPROT):    ("AHB5-AP", MEM_AP,     AP_ALL_TX_SZ ),
+    (AP_JEP106_ARM_CHINA,
+                    AP_CLASS_MEM_AP,    1,  AP_TYPE_AHB5):          ("AHB5-AP", AHB_AP,     AP_ALL_TX_SZ ),
     }

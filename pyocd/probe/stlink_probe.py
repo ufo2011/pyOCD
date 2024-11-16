@@ -1,6 +1,6 @@
 # pyOCD debugger
-# Copyright (c) 2018-2020 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2018-2020,2022 Arm Limited
+# Copyright (c) 2021-2023 Chris Reed
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,14 +15,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from time import sleep
-from typing import (List, Optional)
+from typing import (Any, Callable, Dict, List, Optional, Sequence, Union, TYPE_CHECKING)
 
 from .debug_probe import DebugProbe
 from ..core.memory_interface import MemoryInterface
 from ..core.plugin import Plugin
 from ..core.options import OptionInfo
-from ..coresight.ap import (APVersion, APSEL, APSEL_SHIFT)
+from ..coresight.ap import (APVersion, APSEL, APSEL_SHIFT, APv1Address)
 from .stlink.usb import STLinkUSBInterface
 from .stlink.stlink import STLink
 from .stlink.detect.factory import create_mbed_detector
@@ -30,16 +32,25 @@ from ..board.mbed_board import MbedBoard
 from ..board.board_ids import BOARD_ID_TO_INFO
 from ..utility import conversion
 
+if TYPE_CHECKING:
+    from ..board.board_ids import BoardInfo
+
 class StlinkProbe(DebugProbe):
     """@brief Wraps an STLink as a DebugProbe."""
 
+    _board_id: Optional[str]
+
+    # Shared cache for the STLink Mbed board IDs read from MSD volumes.
+    # The dict maps the serial number to 4-character board ID, or None if no ID is available.
+    _mbed_board_id_cache: Dict[str, Optional[str]] = {}
+
     @classmethod
     def get_all_connected_probes(cls, unique_id: Optional[str] = None,
-            is_explicit: bool = False) -> List["StlinkProbe"]:
+            is_explicit: bool = False) -> List[StlinkProbe]:
         return [cls(dev) for dev in STLinkUSBInterface.get_all_connected_devices()]
 
     @classmethod
-    def get_probe_with_id(cls, unique_id: str, is_explicit: bool = False) -> Optional["StlinkProbe"]:
+    def get_probe_with_id(cls, unique_id: str, is_explicit: bool = False) -> Optional[StlinkProbe]:
         for dev in STLinkUSBInterface.get_all_connected_devices():
             if dev.serial_number == unique_id:
                 return cls(dev)
@@ -52,42 +63,51 @@ class StlinkProbe(DebugProbe):
         self._is_connected = False
         self._nreset_state = False
         self._memory_interfaces = {}
-        self._mbed_info = None
-        self._board_id = self._get_board_id()
+        self._board_id = None
         self._caps = set()
+
+    @property
+    def board_id(self) -> Optional[str]:
+        """@brief Lazily loaded 4-character board ID."""
+        if self._board_id is None:
+            self._board_id = self._get_board_id()
+        return self._board_id
 
     def _get_board_id(self) -> Optional[str]:
         # Try to get the board ID first by sending a command, since it is much faster. This requires
         # opening the USB device, however, and requires a recent STLink firmware version.
         board_id = self._link.get_board_id()
         if board_id is None:
-            # Try to detect associated board info via the STLinkV2-1 MSD volume.
-            detector = create_mbed_detector()
-            if detector is not None:
-                for info in detector.list_mbeds():
-                    if info['target_id_usb_id'] == self._link.serial_number:
-                        self._mbed_info = info
+            # Check the cache.
+            if self._link.serial_number in self._mbed_board_id_cache:
+                board_id = StlinkProbe._mbed_board_id_cache[self._link.serial_number]
+            else:
+                # Try to detect associated board info via the STLinkV2-1 MSD volume.
+                detector = create_mbed_detector()
+                if detector is not None:
+                    for info in detector.list_mbeds():
+                        usb_id = info['target_id_usb_id']
 
                         # Some STLink probes provide an MSD volume, but not the mbed.htm file.
                         # We can live without the board ID, so just ignore any error.
                         try:
-                            board_id = info['target_id_mbed_htm'][0:4]
+                            this_board_id = info['target_id_mbed_htm'][0:4]
                         except KeyError:
-                            pass
-                        break
+                            # No board ID is available for this board.
+                            StlinkProbe._mbed_board_id_cache[usb_id] = None
+                        else:
+                            # Populate the cache with the ID.
+                            StlinkProbe._mbed_board_id_cache[usb_id] = this_board_id
+
+                            # Use this ID if it's for our board.
+                            if usb_id == self._link.serial_number:
+                                board_id = this_board_id
+                                break
         return board_id
 
     @property
     def description(self) -> str:
-        if self._board_id is None:
-            return self.product_name
-
-        try:
-            board_info = BOARD_ID_TO_INFO[self._board_id]
-        except KeyError:
-            return self.product_name
-        else:
-            return "{0} [{1}]".format(board_info.name, board_info.target)
+        return self.product_name
 
     @property
     def vendor_name(self):
@@ -117,10 +137,18 @@ class StlinkProbe(DebugProbe):
     def capabilities(self):
         return self._caps
 
+    @property
+    def associated_board_info(self) -> Optional[BoardInfo]:
+        if (self.board_id is not None) and (self.board_id in BOARD_ID_TO_INFO):
+            return BOARD_ID_TO_INFO[self.board_id]
+        else:
+            return None
+
     def create_associated_board(self):
         assert self.session is not None
-        if self._board_id is not None:
-            return MbedBoard(self.session, board_id=self._board_id)
+        board_info = self.associated_board_info
+        if board_info or self.board_id:
+            return MbedBoard(self.session, board_info=board_info, board_id=self.board_id)
         else:
             return None
 
@@ -229,6 +257,7 @@ class StlinkProbe(DebugProbe):
         # STLink memory access commands only support an 8-bit APSEL.
         if ap_address.ap_version != APVersion.APv1:
             return None
+        assert isinstance(ap_address, APv1Address)
         apsel = ap_address.apsel
         if apsel not in self._memory_interfaces:
             self._link.open_ap(apsel)
@@ -251,45 +280,108 @@ class STLinkMemoryInterface(MemoryInterface):
         self._link = link
         self._apsel = apsel
 
-    def write_memory(self, addr, data, transfer_size=32):
+    def write_memory(self, addr: int, data: int, transfer_size: int=32, **attrs: Any) -> None:
         """@brief Write a single memory location.
 
         By default the transfer size is a word.
         """
         assert transfer_size in (8, 16, 32)
         addr &= 0xffffffff
+        csw = attrs.get('csw', 0)
         if transfer_size == 32:
-            self._link.write_mem32(addr, conversion.u32le_list_to_byte_list([data]), self._apsel)
+            self._link.write_mem32(addr, conversion.u32le_list_to_byte_list([data]), self._apsel, csw)
         elif transfer_size == 16:
-            self._link.write_mem16(addr, conversion.u16le_list_to_byte_list([data]), self._apsel)
+            self._link.write_mem16(addr, conversion.u16le_list_to_byte_list([data]), self._apsel, csw)
         elif transfer_size == 8:
-            self._link.write_mem8(addr, [data], self._apsel)
+            self._link.write_mem8(addr, [data], self._apsel, csw)
 
-    def read_memory(self, addr, transfer_size=32, now=True):
+    def read_memory(self, addr: int, transfer_size: int=32, now: bool=True, **attrs: Any) \
+            -> Union[int, Callable[[], int]]:
         """@brief Read a memory location.
 
         By default, a word will be read.
         """
         assert transfer_size in (8, 16, 32)
         addr &= 0xffffffff
+        csw = attrs.get('csw', 0)
         if transfer_size == 32:
-            result = conversion.byte_list_to_u32le_list(self._link.read_mem32(addr, 4, self._apsel))[0]
+            result = conversion.byte_list_to_u32le_list(self._link.read_mem32(addr, 4, self._apsel, csw))[0]
         elif transfer_size == 16:
-            result = conversion.byte_list_to_u16le_list(self._link.read_mem16(addr, 2, self._apsel))[0]
+            result = conversion.byte_list_to_u16le_list(self._link.read_mem16(addr, 2, self._apsel, csw))[0]
         elif transfer_size == 8:
-            result = self._link.read_mem8(addr, 1, self._apsel)[0]
+            result = self._link.read_mem8(addr, 1, self._apsel, csw)[0]
 
         def read_callback():
             return result
         return result if now else read_callback
 
-    def write_memory_block32(self, addr, data):
+    def write_memory_block32(self, addr: int, data: Sequence[int], **attrs: Any) -> None:
         addr &= 0xffffffff
-        self._link.write_mem32(addr, conversion.u32le_list_to_byte_list(data), self._apsel)
+        csw = attrs.get('csw', 0)
+        self._link.write_mem32(addr, conversion.u32le_list_to_byte_list(data), self._apsel, csw)
 
-    def read_memory_block32(self, addr, size):
+    def read_memory_block32(self, addr: int, size: int, **attrs: Any) -> Sequence[int]:
         addr &= 0xffffffff
-        return conversion.byte_list_to_u32le_list(self._link.read_mem32(addr, size * 4, self._apsel))
+        csw = attrs.get('csw', 0)
+        return conversion.byte_list_to_u32le_list(self._link.read_mem32(addr, size * 4, self._apsel, csw))
+
+    def read_memory_block8(self, addr: int, size: int, **attrs: Any) -> Sequence[int]:
+        addr &= 0xffffffff
+        csw = attrs.get('csw', 0)
+        res = []
+
+        # Transfers are handled in 3 phases:
+        #   1. read 8-bit chunks until the first aligned address is reached,
+        #   2. read 32-bit chunks from all aligned addresses,
+        #   3. read 8-bit chunks from the remaining unaligned addresses.
+        # If the requested size is so small that phase-1 would not even reach
+        # aligned address, go straight to phase-3.
+
+        # 1. read leading unaligned bytes
+        unaligned_count = 3 & (4 - addr)
+        if (size > unaligned_count > 0):
+            res += self._link.read_mem8(addr, unaligned_count, self._apsel, csw)
+            size -= unaligned_count
+            addr += unaligned_count
+
+        # 2. read aligned block of 32 bits
+        if (size >= 4):
+            aligned_size = size & ~3
+            res += self._link.read_mem32(addr, aligned_size, self._apsel, csw)
+            size -= aligned_size
+            addr += aligned_size
+
+        # 3. read trailing unaligned bytes
+        if (size > 0):
+            res += self._link.read_mem8(addr, size, self._apsel, csw)
+
+        return res
+
+    def write_memory_block8(self, addr: int, data: Sequence[int], **attrs: Any) -> None:
+        addr &= 0xffffffff
+        csw = attrs.get('csw', 0)
+        size = len(data)
+        idx = 0
+
+        # write leading unaligned bytes
+        unaligned_count = 3 & (4 - addr)
+        if (size > unaligned_count > 0):
+            self._link.write_mem8(addr, data[:unaligned_count], self._apsel, csw)
+            size -= unaligned_count
+            addr += unaligned_count
+            idx += unaligned_count
+
+        # write aligned block of 32 bits
+        if (size >= 4):
+            aligned_size = size & ~3
+            self._link.write_mem32(addr, data[idx:idx + aligned_size], self._apsel, csw)
+            size -= aligned_size
+            addr += aligned_size
+            idx += aligned_size
+
+        # write trailing unaligned bytes
+        if (size > 0):
+            self._link.write_mem8(addr, data[idx:], self._apsel, csw)
 
 class StlinkProbePlugin(Plugin):
     """@brief Plugin class for StlLinkProbe."""

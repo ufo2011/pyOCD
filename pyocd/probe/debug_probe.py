@@ -1,6 +1,6 @@
 # pyOCD debugger
 # Copyright (c) 2018-2020 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2021-2023 Chris Reed
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from enum import Enum
+from __future__ import annotations
+
+from enum import (Enum, IntFlag)
 import threading
 from typing import (Callable, Collection, Optional, overload, Sequence, Set, TYPE_CHECKING, Tuple, Union)
 from typing_extensions import Literal
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
     from ..core.session import Session
     from ..core.memory_interface import MemoryInterface
     from ..board.board import Board
+    from ..board.board_ids import BoardInfo
     from ..coresight.ap import APAddressBase
 
 class DebugProbe:
@@ -60,6 +63,9 @@ class DebugProbe:
     - swd_sequence(): Capability.SWD_SEQUENCE
     - jtag_sequence(): Capability.JTAG_SEQUENCE
     - swo_*(): Capability.SWO
+    - get_accessible_pins(): Capability.PIN_ACCESS
+    - read_pins(): Capability.PIN_ACCESS
+    - write_pins(): Capability.PIN_ACCESS
     """
 
     class Protocol(Enum):
@@ -67,6 +73,21 @@ class DebugProbe:
         DEFAULT = 0
         SWD = 1
         JTAG = 2
+
+    class PinGroup(Enum):
+        """@brief Available pin groups for read/write pins APIs."""
+        PROTOCOL_PINS = 0
+        GPIO_PINS = 1
+
+    class ProtocolPin(IntFlag):
+        """@brief Pin mask constants for SWD/JTAG protocol pins."""
+        SWCLK_TCK = 1 << 0
+        SWDIO_TMS = 1 << 1
+        TDI = 1 << 2
+        TDO = 1 << 3
+        nRESET = 1 << 4
+        nTRST = 1 << 5
+        ALL_PINS = SWCLK_TCK | SWDIO_TMS | TDI | TDO | nRESET | nTRST
 
     ## Map from wire protocol setting name to debug probe constant.
     PROTOCOL_NAME_MAP = {
@@ -114,8 +135,15 @@ class DebugProbe:
         ## @brief Whether the probe supports the jtag_sequence() API.
         JTAG_SEQUENCE = 7
 
+        ## @brief Pin access via the read_pins()/write_pins() APIs.
+        PIN_ACCESS = 8
+
     @classmethod
-    def get_all_connected_probes(cls, unique_id: str = None, is_explicit: bool = False) -> Sequence["DebugProbe"]:
+    def get_all_connected_probes(
+                cls,
+                unique_id: Optional[str] = None,
+                is_explicit: bool = False
+            ) -> Sequence[DebugProbe]:
         """@brief Returns a list of DebugProbe instances.
 
         To filter the list of returned probes, the `unique_id` parameter may be set to a string with a full or
@@ -134,7 +162,7 @@ class DebugProbe:
         raise NotImplementedError()
 
     @classmethod
-    def get_probe_with_id(cls, unique_id: str, is_explicit: bool = False) -> Optional["DebugProbe"]:
+    def get_probe_with_id(cls, unique_id: str, is_explicit: bool = False) -> Optional[DebugProbe]:
         """@brief Returns a DebugProbe instance for a probe with the given unique ID.
 
         If no probe is connected with a fully matching unique ID, then None will be returned.
@@ -148,16 +176,16 @@ class DebugProbe:
 
     def __init__(self) -> None:
         """@brief Constructor."""
-        self._session: Optional["Session"] = None
+        self._session: Optional[Session] = None
         self._lock = threading.RLock()
 
     @property
-    def session(self) -> Optional["Session"]:
+    def session(self) -> Optional[Session]:
         """@brief Session associated with this probe."""
         return self._session
 
     @session.setter
-    def session(self, the_session: "Session") -> None:
+    def session(self, the_session: Session) -> None:
         self._session = the_session
 
     @property
@@ -218,7 +246,12 @@ class DebugProbe:
         """
         raise NotImplementedError()
 
-    def create_associated_board(self) -> Optional["Board"]:
+    @property
+    def associated_board_info(self) -> Optional[BoardInfo]:
+        """@brief Info about the board associated with this probe, if known."""
+        return None
+
+    def create_associated_board(self) -> Optional[Board]:
         """@brief Create a board instance representing the board of which the probe is a component.
 
         If the probe is part of a board, then this method will create a Board instance that
@@ -227,9 +260,18 @@ class DebugProbe:
         does not have an associated board, then this method returns None.
 
         @param self
-        @param session Session to pass to the board upon construction.
         """
         return None
+
+    def get_accessible_pins(self, group: PinGroup) -> Tuple[int, int]:
+        """@brief Return masks of pins accessible via the .read_pins()/.write_pins() methods.
+
+        This method is only expected to be implemented if Capability.PIN_ACCESS is present.
+
+        @return Tuple of pin masks for (0) readable, (1) writable pins. See DebugProbe.Pin for mask
+        values for those pins that have constants.
+        """
+        raise NotImplementedError()
 
     def open(self) -> None:
         """@brief Open the USB interface to the probe for sending commands."""
@@ -342,6 +384,37 @@ class DebugProbe:
         """
         pass
 
+    def read_pins(self, group: PinGroup, mask: int) -> int:
+        """@brief Read values of selected debug probe pins.
+
+        See DebugProbe.ProtocolPin for mask values for the DebugProbe.PinGroup.PROTOCOL_PINS group.
+
+        This method is only expected to be implemented if Capability.PIN_ACCESS is present.
+
+        @param self
+        @param group Select the pin group to read.
+        @param mask Bit mask indicating which pins will be read. The return value will contain only
+            bits set in this mask.
+        @return Bit mask with the current value of selected pins at each pin's relevant bit position.
+        """
+        raise NotImplementedError()
+
+    def write_pins(self, group: PinGroup, mask: int, value: int) -> None:
+        """@brief Set values of selected debug probe pins.
+
+        See DebugProbe.ProtocolPin for mask values for the DebugProbe.PinGroup.PROTOCOL_PINS group.
+        Note that input-only pins such as TDO are not writable with most debug probes.
+
+        This method is only expected to be implemented if Capability.PIN_ACCESS is present.
+
+        @param self
+        @param group Select the pin group to read.
+        @param mask Bit mask indicating which pins will be written.
+        @param value Mask containing the bit value of to written for selected pins at each pin's
+            relevant bit position..
+        """
+        raise NotImplementedError()
+
     ##@}
 
     ## @name DAP access
@@ -432,7 +505,7 @@ class DebugProbe:
         """@brief Write one AP register multiple times."""
         raise NotImplementedError()
 
-    def get_memory_interface_for_ap(self, ap_address: "APAddressBase") -> Optional["MemoryInterface"]:
+    def get_memory_interface_for_ap(self, ap_address: APAddressBase) -> Optional[MemoryInterface]:
         """@brief Returns a @ref pyocd.core.memory_interface.MemoryInterface "MemoryInterface" for
             the specified AP.
 

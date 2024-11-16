@@ -1,7 +1,8 @@
 # pyOCD debugger
 # Copyright (c) 2015-2020 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2021-2023 Chris Reed
 # Copyright (c) 2022 David Runge
+# Copyright (c) 2022 Toshiba Electronic Devices & Storage Corporation
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,12 +17,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
 import os
+import time
 from natsort import natsorted
 import textwrap
 from time import sleep
 from shutil import get_terminal_size
+from typing import TYPE_CHECKING
 
 from .. import coresight
 from ..core.helpers import ConnectHelper
@@ -47,6 +52,9 @@ from ..utility.mask import (
     bfi,
     )
 from .base import CommandBase
+
+if TYPE_CHECKING:
+    from ..core.core_target import CoreTarget
 
 # Make disasm optional.
 try:
@@ -108,7 +116,7 @@ class StatusCommand(CommandBase):
             for i, c in enumerate(self.context.target.cores):
                 core = self.context.target.cores[c]
                 state_desc = core.get_state().name.capitalize()
-                desc = "Core %d:  %s" % (i, state_desc)
+                desc = f"Core {i} ({core.node_name}):  {state_desc}"
                 if len(core.supported_security_states) > 1:
                     desc += " [%s]" % core.get_security_state().name.capitalize()
                 self.context.write(desc)
@@ -355,10 +363,10 @@ class ResetCommand(CommandBase):
             'category': 'device',
             'nargs': [0, 1, 2],
             'usage': "[halt|-halt|-h] [TYPE]",
-            'help': "Reset the target, optionally specifying the reset type.",
+            'help': "Reset the target, optionally with halt and/or specifying the reset type.",
             'extra_help': "The reset type must be one of 'default', 'hw', 'sw', 'hardware', 'software', "
-                          "'sw_sysresetreq', 'sw_vectreset', 'sw_emulated', 'sysresetreq', 'vectreset', "
-                          "or 'emulated'.",
+                          "'system', 'core', 'emulated', 'sw_system', 'sw_core', 'sw_sysresetreq', "
+                          "'sw_vectreset', 'sw_emulated', 'sysresetreq', or 'vectreset'.",
 
             }
 
@@ -383,8 +391,12 @@ class ResetCommand(CommandBase):
             else:
                 self.context.write("Successfully halted device on reset")
         else:
-            self.context.write("Resetting target")
-            self.context.selected_core.reset(self.reset_type)
+            if self.context.selected_core is None:
+                self.context.write("Resetting via probe")
+                self.context.probe.reset()
+            else:
+                self.context.write("Resetting target")
+                self.context.selected_core.reset(self.reset_type)
 
 class DisassembleCommand(CommandBase):
     INFO = {
@@ -394,8 +406,10 @@ class DisassembleCommand(CommandBase):
             'nargs': [1, 2, 3],
             'usage': "[-c/--center] ADDR [LEN]",
             'help': "Disassemble instructions at an address.",
-            'extra_help': "Only available if the capstone library is installed. To install "
-                           "capstone, run 'pip install capstone'.",
+            'extra_help':
+                "The length argument is in bytes and is optional, with a default of 6. If the -c option "
+                "is used, the disassembly is centered on the given address. Otherwise the disassembly "
+                "begins at the given address.",
             }
 
     def parse(self, args):
@@ -834,15 +848,22 @@ class FindCommand(CommandBase):
             'group': 'standard',
             'category': 'memory',
             'nargs': '*',
-            'usage': "ADDR LEN BYTE+",
+            'usage': "[-n] ADDR LEN BYTE+",
             'help': "Search for a value in memory within the given address range.",
             'extra_help': "A pattern of any number of bytes can be searched for. Each BYTE "
-                           "parameter must be an 8-bit value.",
+                           "parameter must be an 8-bit value. If the -n argument is passed, "
+                           "the search is negated and looks for the first set of bytes that "
+                           "does not match the provided values.",
             }
 
     def parse(self, args):
         if len(args) < 3:
             raise exceptions.CommandError("missing argument")
+        if args[0] == '-n':
+            self.negate = True
+            args.pop(0)
+        else:
+            self.negate = False
         self.addr = self._convert_value(args[0])
         self.length = self._convert_value(args[1])
         self.pattern = bytearray()
@@ -868,7 +889,7 @@ class FindCommand(CommandBase):
             data = bytearray(self.context.selected_ap.read_memory_block8(addr, chunk_size))
 
             offset = data.find(self.pattern)
-            if offset != -1:
+            if (offset != -1) ^ self.negate:
                 match = True
                 self.context.writei("Found pattern at address 0x%08x", addr + offset)
                 break
@@ -1115,20 +1136,44 @@ class RemoveWatchpointCommand(CommandBase):
             'names': ['rmwatch'],
             'group': 'standard',
             'category': 'breakpoints',
-            'nargs': 1,
-            'usage': "ADDR",
-            'help': "Remove a watchpoint.",
+            'nargs': [1, 2, 3],
+            'usage': "ADDR [r|w|rw] [1|2|4]",
+            'help': "Remove watchpoint(s).",
+            'extra_help':
+                    "Access type and size are optional. All watchpoints matching the specified parameters "
+                    "will be removed."
             }
 
     def parse(self, args):
         self.addr = self._convert_value(args[0])
+        if len(args) > 1:
+            try:
+                self.wptype = WATCHPOINT_FUNCTION_NAME_MAP[args[1]]
+            except KeyError:
+                raise exceptions.CommandError(f"unsupported watchpoint type '{args[1]}'")
+        else:
+            self.wptype = None
+        if len(args) > 2:
+            self.sz = self._convert_value(args[2])
+            if self.sz not in (1, 2, 4):
+                raise exceptions.CommandError(f"unsupported watchpoint size ({self.sz})")
+        else:
+            self.sz = None
 
     def execute(self):
         if self.context.selected_core.dwt is None:
             raise exceptions.CommandError("DWT not present")
         try:
-            self.context.selected_core.remove_watchpoint(self.addr)
-            self.context.writei("Removed watchpoint at 0x%08x", self.addr)
+            self.context.selected_core.remove_watchpoint(self.addr, self.sz, self.wptype)
+            if self.sz is not None:
+                wp_desc = f" ({self.sz} bytes"
+                if self.wptype is not None:
+                    type_name = WATCHPOINT_FUNCTION_NAME_MAP[self.wptype]
+                    wp_desc += f", {type_name}"
+                wp_desc += ")"
+            else:
+                wp_desc = ""
+            self.context.write(f"Removed watchpoint(s) at {self.addr:#010x}{wp_desc}")
         except Exception:
             self.context.writei("Failed to remove watchpoint at 0x%08x", self.addr)
 
@@ -1163,8 +1208,8 @@ class SelectCoreCommand(CommandBase):
             'group': 'standard',
             'category': 'core',
             'nargs': [0, 1],
-            'usage': "[NUM]",
-            'help': "Select CPU core by number or print selected core.",
+            'usage': "[NUMBER | NAME]",
+            'help': "Select CPU core by number or name, or print selected core.",
             }
 
     def parse(self, args):
@@ -1173,16 +1218,36 @@ class SelectCoreCommand(CommandBase):
             self.core_num = None
         else:
             self.show_core = False
-            self.core_num = int(args[0], base=0)
+
+            # Attempt to parse the core ID as an int.
+            try:
+                self.core_num = int(args[0], base=0)
+            except ValueError:
+                # Try to look up the argument as a core name (case-insensitive).
+                core = self._find_core_by_name(args[0])
+                self.core_num = core.core_number
+
+    def _find_core_by_name(self, name: str) -> CoreTarget:
+        assert self.context.session.target
+        for core in self.context.session.target.cores.values():
+            if core.node_name is None:
+                continue
+            if core.node_name.casefold() == name.casefold():
+                return core
+        else:
+            raise exceptions.CommandError(f"no core matching name '{name}'")
 
     def execute(self):
+        assert self.context.selected_core
+        assert self.context.session.target
         if self.show_core:
-            self.context.writei("Core %d is selected", self.context.selected_core.core_number)
+            self.context.write(f"Core {self.context.selected_core.core_number} "
+                                f"({self.context.selected_core.node_name}) is selected")
             return
         self.context.selected_core = self.context.session.target.cores[self.core_num]
         core_ap = self.context.selected_core.ap
         self.context.selected_ap_address = core_ap.address
-        self.context.writef("Selected core {} ({})", self.core_num, core_ap.short_description)
+        self.context.write(f"Selected core {self.core_num} ({self.context.selected_core.node_name}) ({core_ap.short_description})")
 
 class ReadDpCommand(CommandBase):
     INFO = {
@@ -1327,6 +1392,7 @@ class ReinitCommand(CommandBase):
 
     def execute(self):
         self.context.target.init()
+        self.context.set_context_defaults()
 
 class WhereCommand(CommandBase):
     INFO = {
@@ -1478,6 +1544,22 @@ class ProbeserverCommand(CommandBase):
                 self.context.write("probe server is running")
             else:
                 self.context.write("probe server is not running")
+
+class SleepCommand(CommandBase):
+    INFO = {
+            'names': ['sleep'],
+            'group': 'standard',
+            'category': 'utility',
+            'nargs': 1,
+            'usage': "MILLISECONDS",
+            'help': "Sleep for a number of milliseconds before continuing.",
+            }
+
+    def parse(self, args):
+        self.delay_secs = self._convert_value(args[0]) / 1000.0
+
+    def execute(self):
+        time.sleep(self.delay_secs)
 
 class ShowCommand(CommandBase):
     INFO = {

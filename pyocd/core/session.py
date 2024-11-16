@@ -1,6 +1,6 @@
 # pyOCD debugger
 # Copyright (c) 2018-2020 Arm Limited
-# Copyright (c) 2021 Chris Reed
+# Copyright (c) 2021-2023 Chris Reed
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,19 +15,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from contextlib import contextmanager
 import logging
 import logging.config
 import yaml
 import os
 from pathlib import Path
+import sys
 import weakref
 from inspect import (getfullargspec, signature)
+from types import SimpleNamespace
 from typing import (Any, Callable, Generator, Sequence, Union, cast, Dict, List, Mapping, Optional, TYPE_CHECKING)
+from typing_extensions import Self
 
 from . import exceptions
 from .options_manager import OptionsManager
-from ..board.board import Board
 from ..utility.notification import Notifier
 
 if TYPE_CHECKING:
@@ -36,6 +40,10 @@ if TYPE_CHECKING:
     from ..probe.debug_probe import DebugProbe
     from ..probe.tcp_probe_server import DebugProbeServer
     from ..gdbserver.gdbserver import GDBServer
+    from ..board.board import Board
+
+# Check whether the eval_str parameter for inspect.signature is available.
+HAS_SIGNATURE_EVAL_STR = (sys.version_info[:2] >= (3, 10))
 
 LOG = logging.getLogger(__name__)
 
@@ -93,8 +101,11 @@ class Session(Notifier):
     ## @brief Weak reference to the most recently created session.
     _current_session: Optional[weakref.ref] = None
 
+    ## An empty session used for options when there is no other session available.
+    _options_session: Optional["Session"] = None
+
     @classmethod
-    def get_current(cls) -> "Session":
+    def get_current(cls) -> Self:
         """@brief Return the most recently created Session instance or a default Session.
 
         By default this method will return the most recently created Session object that is
@@ -110,11 +121,14 @@ class Session(Notifier):
             if session is not None:
                 return session
 
-        return Session(None)
+        # There isn't another session available, so lazily create the options session and return it.
+        if cls._options_session is None:
+            cls._options_session = cls(None)
+        return cls._options_session
 
     def __init__(
             self,
-            probe: Optional["DebugProbe"],
+            probe: Optional[DebugProbe],
             auto_open: bool = True,
             options: Optional[Mapping[str, Any]] = None,
             option_defaults: Optional[Mapping[str, Any]] = None,
@@ -142,6 +156,9 @@ class Session(Notifier):
             defaults for option if they are not set through any other method.
         @param kwargs Session options passed as keyword arguments.
         """
+        # Importing Board here eases circular import issues, and it's only needed here anyway.
+        from ..board.board import Board
+
         super().__init__()
 
         Session._current_session = weakref.ref(self)
@@ -155,8 +172,9 @@ class Session(Notifier):
         self._delegate: Optional[Any] = None
         self._auto_open = auto_open
         self._options = OptionsManager()
-        self._gdbservers: Dict[int, "GDBServer"] = {}
-        self._probeserver: Optional["DebugProbeServer"] = None
+        self._gdbservers: Dict[int, GDBServer] = {}
+        self._probeserver: Optional[DebugProbeServer] = None
+        self._context_state = SimpleNamespace()
 
         # Set this session on the probe, if we were given a probe.
         if probe is not None:
@@ -249,7 +267,9 @@ class Session(Notifier):
         # Look for default filenames if a path wasn't provided.
         if filePath is None:
             for filename in filename_list:
-                thisPath = os.path.join(self.project_dir, filename)
+                thisPath = os.path.expanduser(filename)
+                if not os.path.isabs(thisPath):
+                    thisPath = os.path.join(self.project_dir, filename)
                 if os.path.isfile(thisPath):
                     filePath = thisPath
                     break
@@ -307,7 +327,7 @@ class Session(Notifier):
         return self._inited and not self._closed
 
     @property
-    def probe(self) -> Optional["DebugProbe"]:
+    def probe(self) -> Optional[DebugProbe]:
         """@brief The @ref pyocd.probe.debug_probe.DebugProbe "DebugProbe" instance."""
         return self._probe
 
@@ -317,7 +337,7 @@ class Session(Notifier):
         return self._board
 
     @property
-    def target(self) -> Optional["SoCTarget"]:
+    def target(self) -> Optional[SoCTarget]:
         """@brief The @ref pyocd.core.target.soc_target "SoCTarget" object representing the SoC.
 
         This is the @ref pyocd.core.target.soc_target "SoCTarget" instance owned by the board.
@@ -345,7 +365,7 @@ class Session(Notifier):
         self._delegate = new_delegate
 
     @property
-    def user_script_proxy(self) -> "UserScriptDelegateProxy":
+    def user_script_proxy(self) -> UserScriptDelegateProxy:
         """@brief The UserScriptDelegateProxy object for a loaded user script."""
         # Create a proxy if there isn't already one. This is a fallback in case there isn't a user script,
         # yet a Python $-command is executed and needs the user script namespace in which to run.
@@ -356,21 +376,21 @@ class Session(Notifier):
         return self._user_script_proxy
 
     @property
-    def user_script_print_proxy(self) -> "PrintProxy":
+    def user_script_print_proxy(self) -> PrintProxy:
         return self._user_script_print_proxy
 
     @property
-    def gdbservers(self) -> Dict[int, "GDBServer"]:
+    def gdbservers(self) -> Dict[int, GDBServer]:
         """@brief Dictionary of core numbers to @ref pyocd.gdbserver.gdbserver.GDBServer "GDBServer" instances."""
         return self._gdbservers
 
     @property
-    def probeserver(self) -> Optional["DebugProbeServer"]:
+    def probeserver(self) -> Optional[DebugProbeServer]:
         """@brief A @ref pyocd.probe.tcp_probe_server.DebugProbeServer "DebugProbeServer" instance."""
         return self._probeserver
 
     @probeserver.setter
-    def probeserver(self, server: "DebugProbeServer") -> None:
+    def probeserver(self, server: DebugProbeServer) -> None:
         """@brief Setter for the `probeserver` property."""
         self._probeserver = server
 
@@ -378,6 +398,15 @@ class Session(Notifier):
     def log_tracebacks(self) -> bool:
         """@brief Quick access to debug.traceback option since it is widely used."""
         return cast(bool, self.options.get('debug.traceback'))
+
+    @property
+    def context_state(self) -> SimpleNamespace:
+        """@brief Global session state namespace.
+
+        The returned object is a namespace object on which arbitrary attributes can be read and written
+        to store context relevant state information between separate components.
+        """
+        return self._context_state
 
     def __enter__(self) -> "Session":
         assert self._probe is not None
@@ -389,7 +418,7 @@ class Session(Notifier):
                 raise
         return self
 
-    def __exit__(self, exc_type: type, value: Any, traceback: "TracebackType") -> bool:
+    def __exit__(self, exc_type: type, value: Any, traceback: TracebackType) -> bool:
         self.close()
         return False
 
@@ -433,6 +462,7 @@ class Session(Notifier):
             'RunType': target.Target.RunType,
             'HaltReason': target.Target.HaltReason,
             'ResetType': target.Target.ResetType,
+            'MemoryLoader': loader.MemoryLoader,
             'MemoryType': memory_map.MemoryType,
             'MemoryMap': memory_map.MemoryMap,
             'RamRegion': memory_map.RamRegion,
@@ -441,7 +471,7 @@ class Session(Notifier):
             'DeviceRegion': memory_map.DeviceRegion,
             'FileProgrammer': file_programmer.FileProgrammer,
             'FlashEraser': eraser.FlashEraser,
-            'FlashLoader': loader.FlashLoader,
+            'FlashLoader': loader.FlashLoader, # deprecated
             # User script info
             '__name__': script_name,
             '__file__': script_path,
@@ -541,17 +571,17 @@ class Session(Notifier):
                 self._board.uninit()
                 self._inited = False
             except exceptions.Error:
-                LOG.error("exception during board uninit:", exc_info=self.log_tracebacks)
+                LOG.error("Error during board uninit:", exc_info=self.log_tracebacks)
 
         if self._probe.is_open:
             try:
                 self._probe.disconnect()
             except exceptions.Error:
-                LOG.error("probe exception during disconnect:", exc_info=self.log_tracebacks)
+                LOG.error("Probe error during disconnect:", exc_info=self.log_tracebacks)
             try:
                 self._probe.close()
             except exceptions.Error:
-                LOG.error("probe exception during close:", exc_info=self.log_tracebacks)
+                LOG.error("Probe error during close:", exc_info=self.log_tracebacks)
 
 class UserScriptFunctionProxy:
     """@brief Proxy for user script functions.
@@ -625,7 +655,10 @@ def new_command_decorator(name: Optional[Union[str, Sequence[str]]] = None, help
         classname = names_list[0].capitalize() + "Command"
 
         # Examine the command function's signature to extract arguments and their types.
-        sig = signature(fn)
+        if HAS_SIGNATURE_EVAL_STR:
+            sig = signature(fn, eval_str=True)
+        else:
+            sig = signature(fn)
         arg_converters = []
         has_var_args = False
         usage_fields: List[str] = []
@@ -646,19 +679,35 @@ def new_command_decorator(name: Optional[Union[str, Sequence[str]]] = None, help
             if typ is parm.empty:
                 LOG.error("user command function '%s' is missing type annotation for parameter '%s'",
                         fn.__name__, parm.name)
-                return fn
+                return None
+
+            # If we don't have Python 3.10 or later, then we must manually un-stringize the type.
+            # Using eval() to un-stringize won't work in all cases, but is sufficient for the types
+            # supported by pyocd's commands.
+            if not HAS_SIGNATURE_EVAL_STR:
+                try:
+                    typ = eval(typ, fn.__globals__)
+                except Exception:
+                    LOG.error("parameter '%s' of user command function '%s' has an unsupported type",
+                            parm.name, fn.__name__)
+                    return None
 
             # Otherwise add to param converter list.
-            if issubclass(typ, str):
-                arg_converters.append(lambda _, x: x)
-            elif issubclass(typ, float):
-                arg_converters.append(lambda _, x: float(x))
-            elif issubclass(typ, int):
-                arg_converters.append(CommandBase._convert_value)
-            else:
+            try:
+                if issubclass(typ, str):
+                    arg_converters.append(lambda _, x: x)
+                elif issubclass(typ, float):
+                    arg_converters.append(lambda _, x: float(x))
+                elif issubclass(typ, int):
+                    arg_converters.append(CommandBase._convert_value)
+                else:
+                    LOG.error("parameter '%s' of user command function '%s' has an unsupported type",
+                            parm.name, fn.__name__)
+                    return None
+            except TypeError:
                 LOG.error("parameter '%s' of user command function '%s' has an unsupported type",
                         parm.name, fn.__name__)
-                return fn
+                return None
             usage_fields.append(parm.name.upper())
 
         # parse() method of the new command class.
